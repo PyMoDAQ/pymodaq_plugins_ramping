@@ -300,7 +300,6 @@ class RampExtension(CustomExt):
 
     def quit_fun(self):
         super().quit_fun()
-        self.exit_runner_thread()
         self.h5saver.flush()
         self.h5saver.close()
 
