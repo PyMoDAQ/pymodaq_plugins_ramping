@@ -2,7 +2,7 @@ from typing import Iterable, TYPE_CHECKING
 
 from qtpy import QtWidgets
 
-
+from pymodaq.utils.managers.modules import ModuleType
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.utils import DockArea, Dock
 from pymodaq_gui.parameter.utils import iter_children
@@ -30,6 +30,8 @@ CLASS_NAME = 'RampExtension'  # this should be the name of your class defined be
 class RampExtension(CustomExt):
 
     params = [
+        {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
+        {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 0.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 1.},
@@ -49,15 +51,17 @@ class RampExtension(CustomExt):
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
         """
-        self.module_dock = Dock('Modules')
-        self.module_dock.addWidget(self.modules_manager.settings_tree)
-        self.dockarea.addDock(self.module_dock, 'left')
+        self.settings_dock = Dock('Settings')
+        self.settings_dock.addWidget(self.settings_tree)
+
+        self.dockarea.addDock(self.settings_dock, 'left')
 
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
-        self.modules_manager.set_actuators(actuators=self.dashboard.modules_manager.actuators,
-                                           selected_actuators=[])
-        self.modules_manager.set_detectors(detectors=self.dashboard.modules_manager.detectors,
-                                           selected_detectors=[])
+        super().do_things_after_experiment_set(experiment_name, show_dashboard)
+        self.settings.child('actuator').setLimits(self.modules_manager.actuators_name)
+        self.settings['detectors'] = dict(all_items=self.modules_manager.detectors_name,
+                                          selected=[])
+
 
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
@@ -76,15 +80,25 @@ class RampExtension(CustomExt):
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
-        self.modules_manager.actuators_changed.connect(self.update_ramp_settings)
+        pass
+
+    @property
+    def actuators(self) -> Iterable['DAQ_Move']:
+        return self.modules_manager.actuators_all
+
+    @property
+    def actuators_name(self) -> Iterable[str]:
+        return self.modules_manager.actuators_name
 
     @property
     def actuator(self) -> 'DAQ_Move':
-        return self.modules_manager.actuators[0]
+        return self.modules_manager.get_mod_from_name(self.settings['actuator'],
+                                                      mod=ModuleType.Actuator)
 
-    def update_ramp_settings(self, selected_actuators: Iterable[str]):
-        self.settings.child('ramp', 'start').setOpts(siPrefix=self.actuator.units)
-        self.settings.child('ramp', 'stop').setOpts(siPrefix=self.actuator.units)
+    def update_ramp_settings(self):
+        if self.actuator is not None:
+            self.settings.child('ramp', 'start').setOpts(suffix=self.actuator.units)
+            self.settings.child('ramp', 'stop').setOpts(suffix=self.actuator.units)
 
     def value_changed(self, param):
         """ Actions to perform when one of the param's value in self.settings is changed from the
@@ -102,6 +116,8 @@ class RampExtension(CustomExt):
         """
         if param.name() in ('duration', 'time_step'):
             self.update_n_steps()
+        elif param.name() == 'actuator':
+            self.update_ramp_settings()
 
     def update_n_steps(self):
         self.settings['ramp', 'nsteps'] = self.settings['ramp', 'duration'] / self.settings['ramp', 'time_step']
