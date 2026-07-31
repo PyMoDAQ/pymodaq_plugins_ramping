@@ -1,7 +1,7 @@
 import numpy as np
 
 
-class VariableRamp:
+class RampGenerator:
     def __init__(self, start=0.0, end=10.0, duration=5.0, time_scale=1.0):
         self.start = start
         self.end = end
