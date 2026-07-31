@@ -43,10 +43,9 @@ class RampExtension(CustomExt):
     def __init__(self, parent: gutils.DockArea, dashboard):
         super().__init__(parent, dashboard)
 
-        # info: in an extension, if you want to interact with ControlModules you have to use the
-        # object: self.modules_manager which is a ModulesManager instance from the dashboard
-
         self.setup_ui()
+
+        self.update_n_steps()
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -61,7 +60,6 @@ class RampExtension(CustomExt):
         self.settings.child('actuator').setLimits(self.modules_manager.actuators_name)
         self.settings['detectors'] = dict(all_items=self.modules_manager.detectors_name,
                                           selected=[])
-
 
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
