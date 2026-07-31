@@ -1,12 +1,19 @@
+import dataclasses
+from queue import Queue
 from time import perf_counter
-from typing import Iterable, TYPE_CHECKING
+from typing import Iterable, TYPE_CHECKING, Union
 
 from qtpy import QtWidgets, QtCore
 
+from pymodaq.control_modules.daq_viewer import DAQ_Viewer
+from pymodaq.utils.h5modules import module_saving
 from pymodaq.control_modules.thread_commands import ControlToHardwareMove
+from pymodaq.control_modules.utils import ControlModule
 from pymodaq.utils.data import DataActuator
 from pymodaq.utils.managers.modules import ModuleType
+from pymodaq_data import DataToExport
 from pymodaq_gui import utils as gutils
+from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.utils import DockArea, Dock
 from pymodaq_gui.parameter.utils import iter_children
 from pymodaq_utils.config import GlobalConfig
@@ -15,7 +22,7 @@ from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.extensions.utils import CustomExt
 
 from pymodaq_plugins_ramping.utilities.ramp_generator import RampGenerator
-from pymodaq_utils.utils import ThreadCommand
+from pymodaq_utils.utils import ThreadCommand, find_objects_in_list_from_attr_name_val
 
 if TYPE_CHECKING:
     from pymodaq.control_modules.daq_move import DAQ_Move
@@ -31,11 +38,50 @@ EXTENSION_NAME = 'Ramp'  # the name that will be displayed in the extension list
 CLASS_NAME = 'RampExtension'  # this should be the name of your class defined below
 
 
+class ModuleAndData:
+
+    def __init__(self, module: Union['DAQ_Move', 'DAQ_Viewer'],
+                 module_type: ModuleType,
+                 h5saver: H5Saver):
+        if module_type == ModuleType.Detector:
+            self.module_and_data_saver = module_saving.DetectorTimeSaver(module)
+        else:
+            self.module_and_data_saver = module_saving.ActuatorTimeSaver(module)
+        self.module_and_data_saver.h5saver = h5saver
+
+        self.title: str = module.title
+
+    def append_data(self, dte: DataToExport):
+        node = self.module_and_data_saver.get_set_node()
+        self.module_and_data_saver.add_data(where=node, data=dte)
+
+
+class SaverWorker(QtCore.QObject):
+
+    def __init__(self, queue: Queue[DataToExport],
+                 modules: Iterable[ModuleAndData]):
+        super().__init__()
+
+        self.queue = queue
+        self.modules = modules
+
+    def save_data(self):
+
+        dte = self.queue.get()
+        module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)
+        module.append_data(dte)
+
+
+
+
 class RampExtension(CustomExt):
+
+    start_saver = QtCore.Signal()
 
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
+        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 1, 'suffix': 's', 'siPrefix': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 300.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 900.},
@@ -51,7 +97,12 @@ class RampExtension(CustomExt):
         self._paused_time: float = None
         self.ramp: RampGenerator = None
 
+        self.ramp_timer = QtCore.QTimer()
+
         self._actuator: 'DAQ_Move' = None
+
+        self.h5saver = H5Saver()
+        self.queue: Queue[DataToExport] = Queue()
 
         self.setup_ui()
 
@@ -102,14 +153,54 @@ class RampExtension(CustomExt):
         self.connect_action('pause', self.pause_ramp)
 
     def start_ramp(self):
-        self.ramp_timer = QtCore.QTimer()
         self.ramp_timer.setInterval(int(self.settings['ramp', 'time_step'] *1000))
         self.ramp_timer.timeout.connect(self.update_ramp)
 
+        self.h5saver.init_file(update_h5=True)
+
+        modules = []
+        for detector in self.detectors:
+            detector.settings['main_settings', 'wait_time'] = self.settings['grab_step']
+
+            modules.append(ModuleAndData(detector, ModuleType.Detector, self.h5saver))
+
+        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step']
+
+        modules.append(ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver))
+
+        self.runner_thread = QtCore.QThread()
+        worker = SaverWorker(self.queue, modules)
+        worker.moveToThread(self.runner_thread)
+        self.runner_thread.worker  = worker
+        self.start_saver.connect(worker.save_data)
+
         self.ramp = self.get_ramp()
 
+        self.runner_thread.start()
+        self.start_saver.emit()
+
+        for detector in self.detectors:
+            detector.grab_done_signal.connect(self.append_data)
+            detector.grab_data(True)
+        self.actuator.current_value_signal.connect(self.append_data)
+        self.actuator.get_continuous_actuator_value(get_value=True)
+
         self.ramp_timer.start()
+
         self.set_action_enabled('start', False)
+
+    @property
+    def detectors(self) -> list['DAQ_Viewer']:
+        detectors = []
+        for detector in self.settings['detectors']['selected']:
+            det = self.modules_manager.get_mod_from_name(detector,
+                                                         mod=ModuleType.Detector)
+            if det is not None:
+                detectors.append(det)
+        return detectors
+
+    @property
+    def actuators(self):
 
     def stop_ramp(self):
         self.ramp_timer.stop()
@@ -120,6 +211,9 @@ class RampExtension(CustomExt):
         if do_pause:
             self.ramp_timer.stop()
             self._paused_time = perf_counter()
+            for detector in self.detectors:
+                detector.grab_done_signal.disconnect(self.append_data)
+            self.actuator.current_value_signal.disconnect(self.append_data)
         else:
             self._start_time = perf_counter() - (self._paused_time - self._start_time)
             self.ramp_timer.start()
@@ -134,7 +228,6 @@ class RampExtension(CustomExt):
                                      units=self.actuator.units,)
         self.actuator.command_hardware.emit(
             ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
-        print(actuator_value)
         if elapsed_time > self.settings['ramp', 'duration']:
             self.stop_ramp()
 
@@ -186,6 +279,11 @@ class RampExtension(CustomExt):
         return RampGenerator(self.settings['ramp', 'start'],
                              self.settings['ramp', 'stop'],
                              self.settings['ramp', 'duration'],)
+
+    def append_data(self, data: DataToExport | DataActuator):
+        if isinstance(data, DataActuator):
+            data = DataToExport(data.origin, data=[data])
+        self.queue.put(data)
 
 
 def main():
