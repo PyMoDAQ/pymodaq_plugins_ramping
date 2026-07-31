@@ -1,4 +1,5 @@
 import dataclasses
+import queue
 from queue import Queue
 from time import perf_counter
 from typing import Iterable, TYPE_CHECKING, Union
@@ -66,10 +67,16 @@ class SaverWorker(QtCore.QObject):
         self.modules = modules
 
     def save_data(self):
+        while True:
+            try:
+                dte = self.queue.get(block=False, timeout=1)
+                module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)[0]
+                module.append_data(dte)
+            except queue.Empty:
+                pass
+            except queue.ShutDown:
+                break
 
-        dte = self.queue.get()
-        module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)
-        module.append_data(dte)
 
 
 
@@ -86,7 +93,7 @@ class RampExtension(CustomExt):
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 300.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 900.},
             {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 100, 'suffix': 's', 'siPrefix': True},
-            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 1, 'suffix': 's', 'siPrefix': True},
+            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 5, 'suffix': 's', 'siPrefix': True},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
         ]}]
 
@@ -102,7 +109,7 @@ class RampExtension(CustomExt):
         self._actuator: 'DAQ_Move' = None
 
         self.h5saver = H5Saver()
-        self.queue: Queue[DataToExport] = Queue()
+        self.queue: Queue[DataToExport] = None
 
         self.setup_ui()
 
@@ -113,8 +120,11 @@ class RampExtension(CustomExt):
         """
         self.settings_dock = Dock('Settings')
         self.settings_dock.addWidget(self.settings_tree)
+        self.saving_dock = Dock('Saving')
+        self.saving_dock.addWidget(self.h5saver.settings_tree)
 
         self.dockarea.addDock(self.settings_dock, 'left')
+        self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
 
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
@@ -155,16 +165,16 @@ class RampExtension(CustomExt):
     def start_ramp(self):
         self.ramp_timer.setInterval(int(self.settings['ramp', 'time_step'] *1000))
         self.ramp_timer.timeout.connect(self.update_ramp)
-
+        self.queue: Queue[DataToExport] = Queue()
         self.h5saver.init_file(update_h5=True)
 
         modules = []
         for detector in self.detectors:
-            detector.settings['main_settings', 'wait_time'] = self.settings['grab_step']
+            detector.settings['main_settings', 'wait_time'] = self.settings['grab_step'] * 1000
 
             modules.append(ModuleAndData(detector, ModuleType.Detector, self.h5saver))
 
-        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step']
+        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step'] * 1000
 
         modules.append(ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver))
 
@@ -199,11 +209,11 @@ class RampExtension(CustomExt):
                 detectors.append(det)
         return detectors
 
-    @property
-    def actuators(self):
-
     def stop_ramp(self):
         self.ramp_timer.stop()
+        self.queue.shutdown(True)
+        self.exit_runner_thread()
+        self.h5saver.flush()
         self._start_time = None
         self.set_action_enabled('start', True)
 
@@ -282,8 +292,17 @@ class RampExtension(CustomExt):
 
     def append_data(self, data: DataToExport | DataActuator):
         if isinstance(data, DataActuator):
-            data = DataToExport(data.origin, data=[data])
-        self.queue.put(data)
+            data = DataToExport(data.name, data=[data])
+        try:
+            self.queue.put(data)
+        except queue.ShutDown:
+            pass
+
+    def quit_fun(self):
+        super().quit_fun()
+        self.exit_runner_thread()
+        self.h5saver.flush()
+        self.h5saver.close()
 
 
 def main():
