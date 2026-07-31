@@ -1,33 +1,26 @@
 from qtpy import QtWidgets
 
 from pymodaq_gui import utils as gutils
-from pymodaq_utils.config import Config, ConfigError
+from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
 
 from pymodaq.extensions.utils import CustomExt
 
 
-# todo: replace here *pymodaq_plugins_template* by your plugin package name
-from pymodaq_plugins_template.utils import Config as PluginConfig
 
 logger = set_logger(get_module_name(__file__))
 
-main_config = Config()
-plugin_config = PluginConfig()
+config = GlobalConfig()
 
-# todo: modify this as you wish
-EXTENSION_NAME = 'MY_EXTENSION_NAME'  # the name that will be displayed in the extension list in the
+
+
+EXTENSION_NAME = 'Ramp'  # the name that will be displayed in the extension list in the
 # dashboard
-CLASS_NAME = 'CustomExtensionTemplate'  # this should be the name of your class defined below
+CLASS_NAME = 'RampExtension'  # this should be the name of your class defined below
 
 
-# todo: modify the name of this class to reflect its application and change the name in the main
-# method at the end of the script
-class CustomExtensionTemplate(CustomExt):
+class RampExtension(CustomExt):
 
-    # todo: if you wish to create custom Parameter and corresponding widgets. These will be
-    # automatically added as children of self.settings. Morevover, the self.settings_tree will
-    # render the widgets in a Qtree. If you wish to see it in your app, add is into a Dock
     params = []
 
     def __init__(self, parent: gutils.DockArea, dashboard):
@@ -128,8 +121,7 @@ def main():
     win, dashboard = create_load_dashboard()
     win.mainwindow.setVisible(False)
 
-    win_ext, ext = create_extension(dashboard, CustomExtensionTemplate)
-    win_ext.show()
+    win_ext, ext = create_extension(dashboard, RampExtension)
 
     sys.exit(app.exec())
 
