@@ -39,6 +39,7 @@ class HistogramPlot(CustomApp):
     def value_changed(self, param: Parameter):
         if param.name() == 'autobin':
             self.settings.child('histo', 'nbins').setOpts(readonly=param.value())
+            self.compute_plot_histogram(self._xaxis_name)
         elif param.name() == 'nbins' and not self.settings['histo', 'autobin']:
             if self._xaxis_name is not None:
                 self.compute_plot_histogram(self._xaxis_name)
@@ -105,7 +106,7 @@ class HistogramPlot(CustomApp):
 if __name__ == '__main__':
     app = mkQApp('Histogram')
 
-    file_path = r'C:\Data\2026\20260802\Dataset_20260802_001.h5'
+    file_path = r'C:\Data\2026\20260802\Dataset_20260802_024.h5'
 
     win, area = make_window(title='Histogram', flags=None)
     histo = HistogramPlot(file_path, dockarea=area)
