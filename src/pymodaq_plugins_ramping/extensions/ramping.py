@@ -90,11 +90,17 @@ class RampExtension(CustomExt):
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
         {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 1, 'suffix': 's', 'siPrefix': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
-            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 300.},
+            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 350.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 900.},
             {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 100, 'suffix': 's', 'siPrefix': True},
+            {'title': 'Velocity:', 'name': 'velocity', 'type': 'float', 'value': 0, 'suffix': '', 'siPrefix': True,
+             'readonly': True},
+        ]},
+        {'title': 'Use Steps:', 'name': 'use_steps', 'type': 'bool', 'value': True},
+        {'title': 'Steps:', 'name': 'steps', 'type': 'group', 'children': [
             {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 5, 'suffix': 's', 'siPrefix': True},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
+            {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
         ]}]
 
     def __init__(self, parent: gutils.DockArea, dashboard):
@@ -105,6 +111,7 @@ class RampExtension(CustomExt):
         self.ramp: RampGenerator = None
 
         self.ramp_timer = QtCore.QTimer()
+        self.total_ramp_timer = QtCore.QTimer()
 
         self._actuator: 'DAQ_Move' = None
 
@@ -114,6 +121,9 @@ class RampExtension(CustomExt):
         self.setup_ui()
 
         self.update_n_steps()
+        self.update_velocity()
+
+        self.enable_runflow_actions(False)
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -132,6 +142,8 @@ class RampExtension(CustomExt):
         self.settings['detectors'] = dict(all_items=self.modules_manager.detectors_name,
                                           selected=[])
 
+        self.enable_runflow_actions(True)
+
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
         """
@@ -148,6 +160,8 @@ class RampExtension(CustomExt):
         --------
         ActionManager.add_action
         """
+        self.add_action('ini_positions', 'Init Positions', 'arrows_input',
+                        toolbar=self.toolbar, tip='Go to Initial Ramp position')
         self.add_action('start', 'Start', 'motion_play', "Start the Ramping",
                         icon_color=self.get_theme().green, toolbar=self.toolbar)
         self.add_action('stop', 'Stop Scan', 'stop_circle', "Stop the Ramping",
@@ -155,17 +169,45 @@ class RampExtension(CustomExt):
         self.add_action('pause', 'Pause Scan', 'pause_circle', "Pause/resume the Ramping",
                         checkable=True, toolbar=self.toolbar,
                         icon_checked_color=self.get_theme().orange)
+        self.add_action('save', 'Save', 'save', toolbar=self.toolbar, checkable=True,
+                        tip='Save data', checked=True, icon_checked_color=self.get_theme().green,
+                        icon_color=self.get_theme().red)
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
-        self.connect_action('start', self.start_ramp)
+        self.connect_action('start', self.go_to_ini_and_start)
         self.connect_action('stop', self.stop_ramp)
         self.connect_action('pause', self.pause_ramp)
 
+        self.connect_action('ini_positions', self.go_to_ini_ramp)
+
+    def go_to_ini_ramp(self):
+        actuator_value = DataActuator('ramp',
+                                      data=self.settings['ramp', 'start'],
+                                      units=self.actuator.units, )
+        self.actuator.command_hardware.emit(
+            ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, True]))
+
+    def go_to_ini_and_start(self):
+        self.actuator.move_done_signal.connect(self.start_ramp)
+        self.go_to_ini_ramp()
+
     def start_ramp(self):
-        self.ramp_timer.setInterval(int(self.settings['ramp', 'time_step'] *1000))
-        self.ramp_timer.timeout.connect(self.update_ramp)
+        try:
+            self.actuator.move_done_signal.disconnect(self.start_ramp)
+        except TypeError:
+            pass
+
+        if self.settings['use_steps']:
+            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step'] * 1000))
+            self.ramp_timer.timeout.connect(self.update_ramp)
+
+        self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
+        self.total_ramp_timer.setSingleShot(True)
+        self.total_ramp_timer.timeout.connect(self.stop_ramp)
+
         self.queue: Queue[DataToExport] = Queue()
+
         self.h5saver.init_file(update_h5=True)
 
         modules = []
@@ -195,9 +237,24 @@ class RampExtension(CustomExt):
         self.actuator.current_value_signal.connect(self.append_data)
         self.actuator.get_continuous_actuator_value(get_value=True)
 
-        self.ramp_timer.start()
+        if self.settings['use_steps']:
+            self.ramp_timer.start()
+            self.update_ramp()
+        else:
+            actuator_value = DataActuator('ramp',
+                                          data=self.settings['ramp', 'stop'],
+                                          units=self.actuator.units, )
+            self.actuator.command_hardware.emit(
+                ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
 
-        self.set_action_enabled('start', False)
+        self.total_ramp_timer.start()
+
+        self.enable_runflow_actions(False, excepted=('pause', 'stop'))
+
+    def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
+        for action in ('start', 'ini_positions', 'pause', 'stop'):
+            if action not in excepted:
+                self.set_action_enabled(action, enable)
 
     @property
     def detectors(self) -> list['DAQ_Viewer']:
@@ -211,11 +268,25 @@ class RampExtension(CustomExt):
 
     def stop_ramp(self):
         self.ramp_timer.stop()
+        self.total_ramp_timer.stop()
         self.queue.shutdown(True)
         self.exit_runner_thread()
         self.h5saver.flush()
+        for detector in self.detectors:
+            try:
+                detector.grab_done_signal.disconnect(self.append_data)
+            except TypeError:
+                pass
+            detector.grab_data(False)
+        try:
+            self.actuator.current_value_signal.disconnect(self.append_data)
+        except TypeError:
+            pass
+
+        self.actuator.get_continuous_actuator_value(get_value=False)
+
         self._start_time = None
-        self.set_action_enabled('start', True)
+        self.enable_runflow_actions(True)
 
     def pause_ramp(self, do_pause=True):
         if do_pause:
@@ -226,6 +297,10 @@ class RampExtension(CustomExt):
             self.actuator.current_value_signal.disconnect(self.append_data)
         else:
             self._start_time = perf_counter() - (self._paused_time - self._start_time)
+
+            for detector in self.detectors:
+                detector.grab_done_signal.connect(self.append_data)
+            self.actuator.current_value_signal.connect(self.append_data)
             self.ramp_timer.start()
 
     def update_ramp(self):
@@ -233,13 +308,13 @@ class RampExtension(CustomExt):
             self._start_time = perf_counter()
         elapsed_time = perf_counter() - self._start_time
 
+        step = self.ramp(elapsed_time)
+        self.settings['steps', 'step'] = step
         actuator_value = DataActuator('ramp',
-                                     data=self.ramp(elapsed_time),
+                                     data=step,
                                      units=self.actuator.units,)
         self.actuator.command_hardware.emit(
             ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
-        if elapsed_time > self.settings['ramp', 'duration']:
-            self.stop_ramp()
 
     @property
     def actuators(self) -> Iterable['DAQ_Move']:
@@ -262,6 +337,8 @@ class RampExtension(CustomExt):
             self.settings.child('ramp', 'start').setOpts(suffix=self.actuator.units)
             self.settings.child('ramp', 'stop').setOpts(suffix=self.actuator.units)
 
+            self.settings.child('steps',  'step').setOpts(suffix=self.actuator.units)
+
     def value_changed(self, param):
         """ Actions to perform when one of the param's value in self.settings is changed from the
         user interface
@@ -281,9 +358,19 @@ class RampExtension(CustomExt):
         elif param.name() == 'actuator':
             self._actuator: 'DAQ_Move' = None
             self.update_ramp_settings()
+        elif param.name() == 'use_steps':
+            self.settings.child('steps').show(param.value())
+        if param.name() in ('duration', 'start', 'stop'):
+            self.update_velocity()
 
     def update_n_steps(self):
-        self.settings['ramp', 'nsteps'] = self.settings['ramp', 'duration'] / self.settings['ramp', 'time_step']
+        self.settings['steps', 'nsteps'] = self.settings['ramp', 'duration'] / self.settings['steps', 'time_step']
+
+    def update_velocity(self):
+        if self.actuator is not None:
+            self.settings['ramp', 'velocity'] = (
+                    (self.settings['ramp', 'stop'] - self.settings['ramp', 'start']) / self.settings['ramp', 'duration'])
+            self.settings.child('ramp', 'velocity').setOpts(suffix=f'{self.actuator.units}/s')
 
     def get_ramp(self) -> RampGenerator:
         return RampGenerator(self.settings['ramp', 'start'],
@@ -291,12 +378,13 @@ class RampExtension(CustomExt):
                              self.settings['ramp', 'duration'],)
 
     def append_data(self, data: DataToExport | DataActuator):
-        if isinstance(data, DataActuator):
-            data = DataToExport(data.name, data=[data])
-        try:
-            self.queue.put(data)
-        except queue.ShutDown:
-            pass
+        if self.is_action_checked('save'):
+            if isinstance(data, DataActuator):
+                data = DataToExport(data.name, data=[data])
+            try:
+                self.queue.put(data)
+            except queue.ShutDown:
+                pass
 
     def quit_fun(self):
         super().quit_fun()
