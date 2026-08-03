@@ -20,8 +20,8 @@ class HistogramPlot(CustomApp):
 
     params = [
         {'title': 'Histo:', 'name': 'histo', 'type': 'group', 'children': [
-            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 300.},
-            {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 900.},
+            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
+            {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
             {'title': 'AutoBin:', 'name': 'autobin', 'type': 'led', 'value': True},
             {'title': 'Nbin:', 'name': 'nbins', 'type': 'int', 'value': 100, 'readonly': True},
             ]},
@@ -52,6 +52,8 @@ class HistogramPlot(CustomApp):
         self._xaxis_name = xaxis_name
         with DataLoader(self.h5saver, swmr_mode=True) as dl:
             dte = dl.load_all(where='/RawData')
+        if xaxis_name not in dte.get_names():
+            return
 
         xdwa = dte.pop(dte.index_from_name_origin(xaxis_name))
         ((istart, vstart), (istop, vstop)) = find_index(
@@ -59,9 +61,10 @@ class HistogramPlot(CustomApp):
                                 self.settings['histo', 'stop']])
 
         nav_index = xdwa.nav_indexes[0]
-
-        xdwa_sliced = xdwa.inav[istart:istop]
-
+        try:
+            xdwa_sliced = xdwa.inav[istart:istop]
+        except IndexError:
+            xdwa_sliced = xdwa
         # first compute bins from the timestamps
         timestamps = xdwa_sliced.get_axis_from_index(nav_index)[0].get_data()
         bin_edges = np.histogram_bin_edges(
@@ -106,7 +109,7 @@ class HistogramPlot(CustomApp):
 if __name__ == '__main__':
     app = mkQApp('Histogram')
 
-    file_path = r'C:\Data\2026\20260802\Dataset_20260802_024.h5'
+    file_path = r'C:\Data\2026\20260802\Dataset_20260802_037.h5'
 
     win, area = make_window(title='Histogram', flags=None)
     histo = HistogramPlot(file_path, dockarea=area)
@@ -115,6 +118,6 @@ if __name__ == '__main__':
     area.addDock(dock_settings)
     shared_ui = SharedUI(win)
     shared_ui.affect_application(histo)
-    histo.compute_plot_histogram('TempControl')
+    histo.compute_plot_histogram('Wavelength')
 
     app.exec()

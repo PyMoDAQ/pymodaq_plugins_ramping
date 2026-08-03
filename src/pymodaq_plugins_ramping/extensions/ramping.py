@@ -60,7 +60,7 @@ class ModuleAndData:
 class SaverWorker(QtCore.QObject):
 
     def __init__(self, queue: Queue[DataToExport],
-                 modules: Iterable[ModuleAndData]):
+                 modules: Iterable[ModuleAndData] = None):
         super().__init__()
 
         self.queue = queue
@@ -70,8 +70,10 @@ class SaverWorker(QtCore.QObject):
         while True:
             try:
                 dte = self.queue.get(block=False, timeout=1)
-                module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)[0]
-                module.append_data(dte)
+                if self.modules is not None:
+                    module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)[0]
+                    module.append_data(dte)
+                self.queue.task_done()
             except queue.Empty:
                 pass
             except queue.ShutDown:
@@ -88,11 +90,11 @@ class RampExtension(CustomExt):
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
-        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 1, 'suffix': 's', 'siPrefix': True},
+        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 0.01, 'suffix': 's', 'siPrefix': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
-            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 350.},
-            {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 900.},
-            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 100, 'suffix': 's', 'siPrefix': True},
+            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
+            {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
+            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 40, 'suffix': 's', 'siPrefix': True},
             {'title': 'Velocity:', 'name': 'velocity', 'type': 'float', 'value': 0, 'suffix': '', 'siPrefix': True,
              'readonly': True},
         ]},
@@ -101,7 +103,11 @@ class RampExtension(CustomExt):
             {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 5, 'suffix': 's', 'siPrefix': True},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
-        ]}]
+        ]},
+        {'title': 'Nqueued:', 'name': 'nqueued', 'type': 'int', 'value': 0, 'readonly': True},
+
+    ]
+
 
     def __init__(self, parent: gutils.DockArea, dashboard):
         super().__init__(parent, dashboard)
@@ -111,7 +117,10 @@ class RampExtension(CustomExt):
         self.ramp: RampGenerator = None
 
         self.ramp_timer = QtCore.QTimer()
+        self.ramp_timer.timeout.connect(self.update_ramp)
+
         self.total_ramp_timer = QtCore.QTimer()
+        self.total_ramp_timer.timeout.connect(self.stop_ramp)
 
         self._actuator: 'DAQ_Move' = None
 
@@ -200,11 +209,9 @@ class RampExtension(CustomExt):
 
         if self.settings['use_steps']:
             self.ramp_timer.setInterval(int(self.settings['steps', 'time_step'] * 1000))
-            self.ramp_timer.timeout.connect(self.update_ramp)
 
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
-        self.total_ramp_timer.timeout.connect(self.stop_ramp)
 
         self.queue: Queue[DataToExport] = Queue()
 
@@ -213,17 +220,15 @@ class RampExtension(CustomExt):
         modules = []
         for detector in self.detectors:
             detector.settings['main_settings', 'wait_time'] = self.settings['grab_step'] * 1000
-
             modules.append(ModuleAndData(detector, ModuleType.Detector, self.h5saver))
 
         self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step'] * 1000
-
         modules.append(ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver))
 
         self.runner_thread = QtCore.QThread()
-        worker = SaverWorker(self.queue, modules)
+        worker = SaverWorker(self.queue, modules=modules)
         worker.moveToThread(self.runner_thread)
-        self.runner_thread.worker  = worker
+        self.runner_thread.worker = worker
         self.start_saver.connect(worker.save_data)
 
         self.ramp = self.get_ramp()
@@ -247,7 +252,7 @@ class RampExtension(CustomExt):
             self.actuator.command_hardware.emit(
                 ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
 
-        self.total_ramp_timer.start()
+            self.total_ramp_timer.start()
 
         self.enable_runflow_actions(False, excepted=('pause', 'stop'))
 
@@ -269,9 +274,8 @@ class RampExtension(CustomExt):
     def stop_ramp(self):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
-        self.queue.shutdown(True)
-        self.exit_runner_thread()
-        self.h5saver.flush()
+
+
         for detector in self.detectors:
             try:
                 detector.grab_done_signal.disconnect(self.append_data)
@@ -286,6 +290,15 @@ class RampExtension(CustomExt):
         self.actuator.get_continuous_actuator_value(get_value=False)
 
         self._start_time = None
+
+        while not self.queue.empty():
+            self.settings['nqueued'] = self.queue.qsize()
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(10)
+        self.queue.shutdown(True)
+        self.exit_runner_thread()
+        self.h5saver.flush()
+
         self.enable_runflow_actions(True)
 
     def pause_ramp(self, do_pause=True):
@@ -315,6 +328,9 @@ class RampExtension(CustomExt):
                                      units=self.actuator.units,)
         self.actuator.command_hardware.emit(
             ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
+
+        if elapsed_time > self.settings['ramp', 'duration']:
+            self.stop_ramp()
 
     @property
     def actuators(self) -> Iterable['DAQ_Move']:
@@ -383,6 +399,7 @@ class RampExtension(CustomExt):
                 data = DataToExport(data.name, data=[data])
             try:
                 self.queue.put(data)
+                self.settings['nqueued'] = self.queue.qsize()
             except queue.ShutDown:
                 pass
 
