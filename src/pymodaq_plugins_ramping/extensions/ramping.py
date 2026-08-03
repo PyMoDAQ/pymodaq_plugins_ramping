@@ -131,7 +131,7 @@ class RampExtension(CustomExt):
 
         self.dockarea.addDock(self.settings_dock, 'left')
         self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
-
+        self.saving_dock.setVisible(False)
         self.populate_status_bar()
 
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
@@ -177,12 +177,16 @@ class RampExtension(CustomExt):
         self.add_action('show_file', 'Show file content', 'folder_data',
                         tip='Browse the content of the current HDF5 file')
 
-        self.add_action('new_file', 'New file', 'new2', menu=MenuToolbarNames.FILE, auto_toolbar=False)
-        self.add_action('load', 'Open file to append...', 'Open', menu=MenuToolbarNames.FILE, auto_toolbar=False)
+        self.add_action('new_file', 'New file', 'add_circle', menu=MenuToolbarNames.FILE, auto_toolbar=False)
+        self.add_action('load', 'Open file to append...', 'file_open', menu=MenuToolbarNames.FILE, auto_toolbar=False)
         self.get_menu(MenuToolbarNames.FILE).addSeparator()
         self.add_action('save', 'Save', 'save', toolbar=self.toolbar, checkable=True,
                         tip='Save data', checked=True, icon_checked_color=self.get_theme().green,
                         icon_color=self.get_theme().red)
+
+        self.add_action('show_saving', 'Show Saving Options', 'settings',
+                        menu=MenuToolbarNames.TOOLS, checkable=True,
+                        toolbar=self.toolbar, tip='Display in a Dock the Saving Settings')
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
@@ -196,6 +200,8 @@ class RampExtension(CustomExt):
         self.connect_action('load', lambda: self.load_file())
 
         self.connect_action('show_file', self.show_file_content)
+
+        self.connect_action('show_saving', self.saving_dock.setVisible)
 
     def go_to_ini_ramp(self):
         actuator_value = DataActuator('ramp',
