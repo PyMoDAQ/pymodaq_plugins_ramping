@@ -1,6 +1,5 @@
-import dataclasses
-import queue
-from queue import Queue
+
+from pathlib import Path
 from time import perf_counter
 from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
@@ -18,6 +17,7 @@ from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.utils import DockArea, Dock
 from pymodaq_gui.parameter.utils import iter_children
+from pymodaq_plugins_ramping.utilities.module_saver import RampSaver
 from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
 
@@ -61,9 +61,9 @@ class ModuleAndData:
 class SaverWorker(QtCore.QObject):
     n_saved = QtCore.Signal(int)
 
-    def __init__(self, modules: Mapping[str, ModuleAndData]):
+    def __init__(self, module: RampSaver):
         super().__init__()
-        self.modules = modules
+        self.module: RampSaver = module
         self._n_saved = 0
 
         # self.n_saved_timer = QtCore.QTimer()
@@ -72,7 +72,7 @@ class SaverWorker(QtCore.QObject):
 
     @QtCore.Slot(DataToExport)
     def save_data(self, dte: DataToExport):
-        self.modules[dte.name].append_data(dte)
+        self.module.add_data(dte)
         self._n_saved += 1
         self.n_saved.emit(self._n_saved)
 
@@ -83,6 +83,8 @@ class SaverWorker(QtCore.QObject):
 class RampExtension(CustomExt):
     send_data_signal = QtCore.Signal(DataToExport)
     _worker_done = QtCore.Signal()
+
+    _group_name = 'Ramp'
 
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
@@ -125,7 +127,8 @@ class RampExtension(CustomExt):
 
         self._actuator: 'DAQ_Move' = None
 
-        self.h5saver = H5Saver()
+        self._h5saver: H5Saver = None
+        self._module_and_data_saver = RampSaver(self)
 
         self.setup_ui()
 
@@ -133,6 +136,125 @@ class RampExtension(CustomExt):
         self.update_velocity()
 
         self.enable_runflow_actions(False)
+
+    @property
+    def h5saver(self):
+        if self._h5saver is None:
+            self._h5saver = H5Saver()
+            self._h5saver.settings.child('do_save').hide()
+            self._h5saver.settings.child('custom_name').hide()
+            self._h5saver.settings['base_name'] = self._group_name
+            self._h5saver.new_file_sig.connect(self.create_new_file)
+
+        if self._h5saver.h5_file is None or not self._h5saver.isopen():
+            # Check if there's an existing file to reopen
+            current_file = self._h5saver.settings['current_h5_file']
+            if current_file and Path(current_file).exists():
+                self._try_open_existing_file(current_file)
+                self._h5saver.init_file(update_h5=False)
+            else:
+                try:
+                    self._h5saver.init_file(update_h5=True)
+                except Exception as e:
+                    logger.warning(f"Could not initialize h5 file: {e}")
+        return self._h5saver
+
+    def create_new_file(self, new_file):
+        if new_file:
+            self.close_file()
+            # Explicitly create a new file (don't reopen existing)
+            try:
+                self._h5saver.init_file(update_h5=True)
+                logger.info(f"Created new h5 file: {self._h5saver.settings['current_h5_file']}")
+            except Exception as e:
+                logger.error(f"Could not create new h5 file: {e}")
+
+        if hasattr(self, '_module_and_data_saver'):
+            self.module_and_data_saver.h5saver = self._h5saver  # force it for detectors to update their h5saver
+
+    def open_file(self):
+        """Reopen the current h5 file if it is closed."""
+        if self._h5saver is not None and not self._h5saver.isopen():
+            current_file = self._h5saver.settings['current_h5_file']
+            if current_file and Path(current_file).exists():
+                self._try_open_existing_file(current_file)
+            else:
+                logger.warning('No file to reopen')
+
+    def close_file(self):
+        self._h5saver.close_file()
+
+    def _try_open_existing_file(self, current_file: str):
+        """Try to open an existing file, asking user what to do if locked."""
+        while True:
+            try:
+                logger.debug(f"Reopening existing h5 file: {current_file}")
+                self._h5saver.init_file(addhoc_file_path=current_file)
+                break  # Success
+            except Exception as e:
+                if 'lock' in str(e).lower() or 'errno = 0' in str(e).lower():
+                    # File is locked - ask user what to do
+                    msg = QtWidgets.QMessageBox()
+                    msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+                    msg.setWindowTitle("File Locked")
+                    msg.setText(f"Cannot open file:\n{current_file}\n\n"
+                                f"The file may be open in another application.")
+                    msg.setInformativeText("Close the file elsewhere and click Retry, "
+                                           "or select a different file.")
+                    retry_btn = msg.addButton("Retry", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+                    new_auto_btn = msg.addButton("New File (Auto)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                    browse_btn = msg.addButton("Browse...", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+                    msg.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+                    msg.exec()
+
+                    if msg.clickedButton() == retry_btn:
+                        continue  # Try again
+                    elif msg.clickedButton() == new_auto_btn:
+                        logger.info("User chose to create new file (auto)")
+                        self._h5saver.init_file(update_h5=True)
+                        break
+                    elif msg.clickedButton() == browse_btn:
+                        # Let user select an existing file to append to
+                        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                            None, "Select HDF5 File",
+                            str(Path(current_file).parent),
+                            "HDF5 Files (*.h5);;All Files (*)",
+                        )
+                        if file_path:
+                            logger.info(f"User selected file: {file_path}")
+                            try:
+                                self._h5saver.init_file(addhoc_file_path=file_path)
+                                break
+                            except Exception as e2:
+                                logger.warning(f"Could not open selected file: {e2}")
+                                continue  # Show dialog again
+                        else:
+                            continue  # User cancelled browse, show dialog again
+                    else:
+                        # User cancelled - leave h5_file unchanged
+                        logger.info("User cancelled file selection - keeping current file state")
+                        break
+                else:
+                    # Other error - fall back to new file
+                    logger.warning(f"Could not reopen h5 file: {e}")
+                    self._h5saver.init_file(update_h5=True)
+                    break
+
+    @property
+    def module_and_data_saver(self):
+        if (self._module_and_data_saver.h5saver is None
+                or not self._module_and_data_saver.h5saver.isopen()):
+            self._module_and_data_saver.h5saver = self.h5saver
+        return self._module_and_data_saver
+
+    @module_and_data_saver.setter
+    def module_and_data_saver(self, mod: RampSaver):
+        self._module_and_data_saver = mod
+        self._module_and_data_saver.h5saver = self.h5saver
+
+    def setup_saving(self):
+        node_name = self.module_and_data_saver.get_set_node(new=True)
+        self.h5saver.settings.child('current_scan_name').setValue(node_name)
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -152,6 +274,7 @@ class RampExtension(CustomExt):
                                           selected=[])
 
         self.enable_runflow_actions(True)
+        self._module_and_data_saver = RampSaver(self)
 
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
@@ -218,22 +341,20 @@ class RampExtension(CustomExt):
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
 
-        self.h5saver.init_file(update_h5=True)
+        self.setup_saving()
+
         self._n_emitted = 0
 
-        modules = dict([])
         for detector in self.detectors:
             detector.settings['main_settings', 'wait_time'] = self.settings['grab_step'] * 1000
-            modules[detector.title] = ModuleAndData(detector, ModuleType.Detector, self.h5saver)
 
         self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step'] * 1000
-        modules[self.actuator.title] = ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver)
 
         if self.runner_thread is not None and self.runner_thread.isRunning():
             self.exit_runner_thread()
 
         self.runner_thread = QtCore.QThread()
-        self.worker = SaverWorker(modules=modules)
+        self.worker = SaverWorker(module=self.module_and_data_saver)
         self.worker.n_saved.connect(self.update_worker_ntask)
         self.send_data_signal.connect(self.worker.save_data)
         self.worker.moveToThread(self.runner_thread)
@@ -306,6 +427,7 @@ class RampExtension(CustomExt):
     def terminate_worker(self):
         self.exit_runner_thread()
         self.h5saver.flush()
+        self.h5saver.close_file()
         self.enable_runflow_actions(True)
         self.settings['worker', 'worker_running'] = False
 
