@@ -6,17 +6,15 @@ from typing import Iterable, TYPE_CHECKING, Union, Mapping
 from qtpy import QtWidgets, QtCore
 
 
-from pymodaq.control_modules.daq_viewer import DAQ_Viewer
-from pymodaq.utils.h5modules import module_saving
 from pymodaq.control_modules.thread_commands import ControlToHardwareMove
-from pymodaq.control_modules.utils import ControlModule
 from pymodaq.utils.data import DataActuator
 from pymodaq.utils.managers.modules import ModuleType
 from pymodaq_data import DataToExport, DataWithAxes
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.utils import DockArea, Dock
-from pymodaq_gui.parameter.utils import iter_children
+
+from pymodaq_gui.utils.shared_ui import MenuToolbarNames
 from pymodaq_plugins_ramping.utilities.module_saver import RampSaver
 from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
@@ -24,11 +22,11 @@ from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.extensions.utils import CustomExt
 
 from pymodaq_plugins_ramping.utilities.ramp_generator import RampGenerator
-from pymodaq_utils.utils import ThreadCommand, find_objects_in_list_from_attr_name_val
+from pymodaq_utils.utils import ThreadCommand
 
 if TYPE_CHECKING:
     from pymodaq.control_modules.daq_move import DAQ_Move
-
+    from pymodaq.control_modules.daq_viewer import DAQ_Viewer
 
 logger = set_logger(get_module_name(__file__))
 config = GlobalConfig()
@@ -38,24 +36,6 @@ config = GlobalConfig()
 EXTENSION_NAME = 'Ramp'  # the name that will be displayed in the extension list in the
 # dashboard
 CLASS_NAME = 'RampExtension'  # this should be the name of your class defined below
-
-
-class ModuleAndData:
-
-    def __init__(self, module: Union['DAQ_Move', 'DAQ_Viewer'],
-                 module_type: ModuleType,
-                 h5saver: H5Saver):
-        if module_type == ModuleType.Detector:
-            self.module_and_data_saver = module_saving.DetectorTimeSaver(module)
-        else:
-            self.module_and_data_saver = module_saving.ActuatorTimeSaver(module)
-        self.module_and_data_saver.h5saver = h5saver
-
-        self.title: str = module.title
-
-    def append_data(self, dte: DataToExport):
-        node = self.module_and_data_saver.get_set_node()
-        self.module_and_data_saver.add_data(where=node, data=dte)
 
 
 class SaverWorker(QtCore.QObject):
@@ -84,8 +64,8 @@ class RampExtension(CustomExt):
     send_data_signal = QtCore.Signal(DataToExport)
     _worker_done = QtCore.Signal()
 
-    _group_name = 'Ramp'
-
+    _h5_base_group_name = 'Ramp'
+    _show_h5file_widgets = True
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
@@ -127,7 +107,6 @@ class RampExtension(CustomExt):
 
         self._actuator: 'DAQ_Move' = None
 
-        self._h5saver: H5Saver = None
         self._module_and_data_saver = RampSaver(self)
 
         self.setup_ui()
@@ -137,124 +116,10 @@ class RampExtension(CustomExt):
 
         self.enable_runflow_actions(False)
 
-    @property
-    def h5saver(self):
-        if self._h5saver is None:
-            self._h5saver = H5Saver()
-            self._h5saver.settings.child('do_save').hide()
-            self._h5saver.settings.child('custom_name').hide()
-            self._h5saver.settings['base_name'] = self._group_name
-            self._h5saver.new_file_sig.connect(self.create_new_file)
-
-        if self._h5saver.h5_file is None or not self._h5saver.isopen():
-            # Check if there's an existing file to reopen
-            current_file = self._h5saver.settings['current_h5_file']
-            if current_file and Path(current_file).exists():
-                self._try_open_existing_file(current_file)
-                self._h5saver.init_file(update_h5=False)
-            else:
-                try:
-                    self._h5saver.init_file(update_h5=True)
-                except Exception as e:
-                    logger.warning(f"Could not initialize h5 file: {e}")
-        return self._h5saver
-
-    def create_new_file(self, new_file):
-        if new_file:
-            self.close_file()
-            # Explicitly create a new file (don't reopen existing)
-            try:
-                self._h5saver.init_file(update_h5=True)
-                logger.info(f"Created new h5 file: {self._h5saver.settings['current_h5_file']}")
-            except Exception as e:
-                logger.error(f"Could not create new h5 file: {e}")
-
-        if hasattr(self, '_module_and_data_saver'):
-            self.module_and_data_saver.h5saver = self._h5saver  # force it for detectors to update their h5saver
-
-    def open_file(self):
-        """Reopen the current h5 file if it is closed."""
-        if self._h5saver is not None and not self._h5saver.isopen():
-            current_file = self._h5saver.settings['current_h5_file']
-            if current_file and Path(current_file).exists():
-                self._try_open_existing_file(current_file)
-            else:
-                logger.warning('No file to reopen')
-
-    def close_file(self):
-        self._h5saver.close_file()
-
-    def _try_open_existing_file(self, current_file: str):
-        """Try to open an existing file, asking user what to do if locked."""
-        while True:
-            try:
-                logger.debug(f"Reopening existing h5 file: {current_file}")
-                self._h5saver.init_file(addhoc_file_path=current_file)
-                break  # Success
-            except Exception as e:
-                if 'lock' in str(e).lower() or 'errno = 0' in str(e).lower():
-                    # File is locked - ask user what to do
-                    msg = QtWidgets.QMessageBox()
-                    msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-                    msg.setWindowTitle("File Locked")
-                    msg.setText(f"Cannot open file:\n{current_file}\n\n"
-                                f"The file may be open in another application.")
-                    msg.setInformativeText("Close the file elsewhere and click Retry, "
-                                           "or select a different file.")
-                    retry_btn = msg.addButton("Retry", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-                    new_auto_btn = msg.addButton("New File (Auto)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-                    browse_btn = msg.addButton("Browse...", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-                    msg.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-                    msg.exec()
-
-                    if msg.clickedButton() == retry_btn:
-                        continue  # Try again
-                    elif msg.clickedButton() == new_auto_btn:
-                        logger.info("User chose to create new file (auto)")
-                        self._h5saver.init_file(update_h5=True)
-                        break
-                    elif msg.clickedButton() == browse_btn:
-                        # Let user select an existing file to append to
-                        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                            None, "Select HDF5 File",
-                            str(Path(current_file).parent),
-                            "HDF5 Files (*.h5);;All Files (*)",
-                        )
-                        if file_path:
-                            logger.info(f"User selected file: {file_path}")
-                            try:
-                                self._h5saver.init_file(addhoc_file_path=file_path)
-                                break
-                            except Exception as e2:
-                                logger.warning(f"Could not open selected file: {e2}")
-                                continue  # Show dialog again
-                        else:
-                            continue  # User cancelled browse, show dialog again
-                    else:
-                        # User cancelled - leave h5_file unchanged
-                        logger.info("User cancelled file selection - keeping current file state")
-                        break
-                else:
-                    # Other error - fall back to new file
-                    logger.warning(f"Could not reopen h5 file: {e}")
-                    self._h5saver.init_file(update_h5=True)
-                    break
-
-    @property
-    def module_and_data_saver(self):
-        if (self._module_and_data_saver.h5saver is None
-                or not self._module_and_data_saver.h5saver.isopen()):
-            self._module_and_data_saver.h5saver = self.h5saver
-        return self._module_and_data_saver
-
-    @module_and_data_saver.setter
-    def module_and_data_saver(self, mod: RampSaver):
-        self._module_and_data_saver = mod
-        self._module_and_data_saver.h5saver = self.h5saver
-
     def setup_saving(self):
         node_name = self.module_and_data_saver.get_set_node(new=True)
         self.h5saver.settings.child('current_scan_name').setValue(node_name)
+        self.update_file_status_led()
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -266,6 +131,8 @@ class RampExtension(CustomExt):
 
         self.dockarea.addDock(self.settings_dock, 'left')
         self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
+
+        self.populate_status_bar()
 
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
@@ -279,8 +146,9 @@ class RampExtension(CustomExt):
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
         """
-        # todo create and populate menu using actions defined above in self.setup_actions
-        pass
+        self.add_menu(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(), parent_menu=menubar)
+        self.add_menu(MenuToolbarNames.TOOLS, MenuToolbarNames.TOOLS.capitalize(), parent_menu=menubar)
+        self.add_menu('actions', 'Actions', parent_menu=menubar)
 
     def do_things_after_ui_setup(self):
         self.create_dashboard_toolbar(add_break=False)
@@ -293,14 +161,25 @@ class RampExtension(CustomExt):
         ActionManager.add_action
         """
         self.add_action('ini_positions', 'Init Positions', 'arrows_input',
+                        menu='actions',
                         toolbar=self.toolbar, tip='Go to Initial Ramp position')
         self.add_action('start', 'Start', 'motion_play', "Start the Ramping",
+                        menu='actions',
                         icon_color=self.get_theme().green, toolbar=self.toolbar)
         self.add_action('stop', 'Stop Scan', 'stop_circle', "Stop the Ramping",
+                        menu='actions',
                         icon_color=self.get_theme().red, toolbar=self.toolbar)
-        self.add_action('pause', 'Pause Scan', 'pause_circle', "Pause/resume the Ramping",
+        self.add_action('pause', 'Pause Scan', 'pause_circle',
+                        menu='actions', tip="Pause/resume the Ramping",
                         checkable=True, toolbar=self.toolbar,
                         icon_checked_color=self.get_theme().orange)
+        self._toolbar.addSeparator()
+        self.add_action('show_file', 'Show file content', 'folder_data',
+                        tip='Browse the content of the current HDF5 file')
+
+        self.add_action('new_file', 'New file', 'new2', menu=MenuToolbarNames.FILE, auto_toolbar=False)
+        self.add_action('load', 'Open file to append...', 'Open', menu=MenuToolbarNames.FILE, auto_toolbar=False)
+        self.get_menu(MenuToolbarNames.FILE).addSeparator()
         self.add_action('save', 'Save', 'save', toolbar=self.toolbar, checkable=True,
                         tip='Save data', checked=True, icon_checked_color=self.get_theme().green,
                         icon_color=self.get_theme().red)
@@ -312,6 +191,11 @@ class RampExtension(CustomExt):
         self.connect_action('pause', self.pause_ramp)
 
         self.connect_action('ini_positions', self.go_to_ini_ramp)
+
+        self.connect_action('new_file', self.create_new_file)
+        self.connect_action('load', lambda: self.load_file())
+
+        self.connect_action('show_file', self.show_file_content)
 
     def go_to_ini_ramp(self):
         actuator_value = DataActuator('ramp',
@@ -341,7 +225,8 @@ class RampExtension(CustomExt):
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
 
-        self.setup_saving()
+        if self.is_action_checked('save'):
+            self.setup_saving()
 
         self._n_emitted = 0
 
@@ -353,11 +238,12 @@ class RampExtension(CustomExt):
         if self.runner_thread is not None and self.runner_thread.isRunning():
             self.exit_runner_thread()
 
-        self.runner_thread = QtCore.QThread()
-        self.worker = SaverWorker(module=self.module_and_data_saver)
-        self.worker.n_saved.connect(self.update_worker_ntask)
-        self.send_data_signal.connect(self.worker.save_data)
-        self.worker.moveToThread(self.runner_thread)
+        if self.is_action_checked('save'):
+            self.runner_thread = QtCore.QThread()
+            self.worker = SaverWorker(module=self.module_and_data_saver)
+            self.worker.n_saved.connect(self.update_worker_ntask)
+            self.send_data_signal.connect(self.worker.save_data)
+            self.worker.moveToThread(self.runner_thread)
 
         self.ramp = self.get_ramp()
 
@@ -386,7 +272,7 @@ class RampExtension(CustomExt):
         self.enable_runflow_actions(False, excepted=('pause', 'stop'))
 
     def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
-        for action in ('start', 'ini_positions', 'pause', 'stop'):
+        for action in ('start', 'ini_positions', 'pause', 'stop', 'save'):
             if action not in excepted:
                 self.set_action_enabled(action, enable)
 
@@ -428,6 +314,7 @@ class RampExtension(CustomExt):
         self.exit_runner_thread()
         self.h5saver.flush()
         self.h5saver.close_file()
+        self.update_file_status_led()
         self.enable_runflow_actions(True)
         self.settings['worker', 'worker_running'] = False
 
@@ -524,10 +411,11 @@ class RampExtension(CustomExt):
                              self.settings['ramp', 'duration'],)
 
     def send_data(self, dte: DataToExport | DataActuator):
-        if isinstance(dte, DataActuator):
-            dte = DataToExport(dte.name, data=[dte])
-        self.send_data_signal.emit(dte)
-        self._n_emitted += 1
+        if self.is_action_checked('save'):
+            if isinstance(dte, DataActuator):
+                dte = DataToExport(dte.name, data=[dte])
+            self.send_data_signal.emit(dte)
+            self._n_emitted += 1
 
     @QtCore.Slot(int)
     def update_worker_ntask(self, n_saved: int):
@@ -537,11 +425,11 @@ class RampExtension(CustomExt):
         if n_tasks == 0:
             self._worker_done.emit()
 
-
     def quit_fun(self):
-        super().quit_fun()
         self.h5saver.flush()
         self.h5saver.close()
+        super().quit_fun()
+
 
 
 def main():
