@@ -2,9 +2,10 @@ import dataclasses
 import queue
 from queue import Queue
 from time import perf_counter
-from typing import Iterable, TYPE_CHECKING, Union
+from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
 from qtpy import QtWidgets, QtCore
+
 
 from pymodaq.control_modules.daq_viewer import DAQ_Viewer
 from pymodaq.utils.h5modules import module_saving
@@ -12,7 +13,7 @@ from pymodaq.control_modules.thread_commands import ControlToHardwareMove
 from pymodaq.control_modules.utils import ControlModule
 from pymodaq.utils.data import DataActuator
 from pymodaq.utils.managers.modules import ModuleType
-from pymodaq_data import DataToExport
+from pymodaq_data import DataToExport, DataWithAxes
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.utils import DockArea, Dock
@@ -58,39 +59,35 @@ class ModuleAndData:
 
 
 class SaverWorker(QtCore.QObject):
+    n_saved = QtCore.Signal(int)
 
-    def __init__(self, queue: Queue[DataToExport],
-                 modules: Iterable[ModuleAndData] = None):
+    def __init__(self, modules: Mapping[str, ModuleAndData]):
         super().__init__()
-
-        self.queue = queue
         self.modules = modules
+        self._n_saved = 0
 
-    def save_data(self):
-        while True:
-            try:
-                dte = self.queue.get(block=False, timeout=1)
-                if self.modules is not None:
-                    module: ModuleAndData = find_objects_in_list_from_attr_name_val(self.modules, 'title', dte.name)[0]
-                    module.append_data(dte)
-                self.queue.task_done()
-            except queue.Empty:
-                pass
-            except queue.ShutDown:
-                break
+        # self.n_saved_timer = QtCore.QTimer()
+        # self.n_saved_timer.setInterval(100)
+        # self.n_saved_timer.timeout.connect(self.send_n_saved)
 
+    @QtCore.Slot(DataToExport)
+    def save_data(self, dte: DataToExport):
+        self.modules[dte.name].append_data(dte)
+        self._n_saved += 1
+        self.n_saved.emit(self._n_saved)
 
-
+    # def send_n_saved(self):
+    #     self.n_saved.emit(self._n_saved)
 
 
 class RampExtension(CustomExt):
-
-    start_saver = QtCore.Signal()
+    send_data_signal = QtCore.Signal(DataToExport)
+    _worker_done = QtCore.Signal()
 
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
-        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 0.01, 'suffix': 's', 'siPrefix': True},
+        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 0.1, 'suffix': 's', 'siPrefix': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
@@ -100,12 +97,14 @@ class RampExtension(CustomExt):
         ]},
         {'title': 'Use Steps:', 'name': 'use_steps', 'type': 'bool', 'value': True},
         {'title': 'Steps:', 'name': 'steps', 'type': 'group', 'children': [
-            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 5, 'suffix': 's', 'siPrefix': True},
+            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 0.2, 'suffix': 's', 'siPrefix': True},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
         ]},
-        {'title': 'Nqueued:', 'name': 'nqueued', 'type': 'int', 'value': 0, 'readonly': True},
-
+        {'title': 'Worker:', 'name': 'worker', 'type': 'group', 'children': [
+            {'title': 'Worker Running:', 'name': 'worker_running', 'type': 'led', 'value': False, 'readonly': True},
+            {'title': 'Worker tasks:', 'name': 'worker_tasks', 'type': 'int', 'value': 0, 'readonly': True},
+        ]},
     ]
 
 
@@ -116,6 +115,8 @@ class RampExtension(CustomExt):
         self._paused_time: float = None
         self.ramp: RampGenerator = None
 
+        self._n_emitted = 0
+
         self.ramp_timer = QtCore.QTimer()
         self.ramp_timer.timeout.connect(self.update_ramp)
 
@@ -125,7 +126,6 @@ class RampExtension(CustomExt):
         self._actuator: 'DAQ_Move' = None
 
         self.h5saver = H5Saver()
-        self.queue: Queue[DataToExport] = None
 
         self.setup_ui()
 
@@ -207,39 +207,47 @@ class RampExtension(CustomExt):
         except TypeError:
             pass
 
+        try:
+            self._worker_done.disconnect(self.terminate_worker)
+        except TypeError:
+            pass
+
         if self.settings['use_steps']:
             self.ramp_timer.setInterval(int(self.settings['steps', 'time_step'] * 1000))
 
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
 
-        self.queue: Queue[DataToExport] = Queue()
-
         self.h5saver.init_file(update_h5=True)
+        self._n_emitted = 0
 
-        modules = []
+        modules = dict([])
         for detector in self.detectors:
             detector.settings['main_settings', 'wait_time'] = self.settings['grab_step'] * 1000
-            modules.append(ModuleAndData(detector, ModuleType.Detector, self.h5saver))
+            modules[detector.title] = ModuleAndData(detector, ModuleType.Detector, self.h5saver)
 
         self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step'] * 1000
-        modules.append(ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver))
+        modules[self.actuator.title] = ModuleAndData(self.actuator, ModuleType.Actuator, self.h5saver)
+
+        if self.runner_thread is not None and self.runner_thread.isRunning():
+            self.exit_runner_thread()
 
         self.runner_thread = QtCore.QThread()
-        worker = SaverWorker(self.queue, modules=modules)
-        worker.moveToThread(self.runner_thread)
-        self.runner_thread.worker = worker
-        self.start_saver.connect(worker.save_data)
+        self.worker = SaverWorker(modules=modules)
+        self.worker.n_saved.connect(self.update_worker_ntask)
+        self.send_data_signal.connect(self.worker.save_data)
+        self.worker.moveToThread(self.runner_thread)
 
         self.ramp = self.get_ramp()
 
         self.runner_thread.start()
-        self.start_saver.emit()
+        self.settings['worker', 'worker_running'] = True
 
+        # connect data signals to the event loop of the worker thread
         for detector in self.detectors:
-            detector.grab_done_signal.connect(self.append_data)
+            detector.grab_done_signal.connect(self.send_data)
             detector.grab_data(True)
-        self.actuator.current_value_signal.connect(self.append_data)
+        self.actuator.current_value_signal.connect(self.send_data)
         self.actuator.get_continuous_actuator_value(get_value=True)
 
         if self.settings['use_steps']:
@@ -275,15 +283,14 @@ class RampExtension(CustomExt):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
 
-
         for detector in self.detectors:
             try:
-                detector.grab_done_signal.disconnect(self.append_data)
+                detector.grab_done_signal.disconnect(self.send_data)
             except TypeError:
                 pass
             detector.grab_data(False)
         try:
-            self.actuator.current_value_signal.disconnect(self.append_data)
+            self.actuator.current_value_signal.disconnect(self.send_data)
         except TypeError:
             pass
 
@@ -291,29 +298,30 @@ class RampExtension(CustomExt):
 
         self._start_time = None
 
-        while not self.queue.empty():
-            self.settings['nqueued'] = self.queue.qsize()
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(10)
-        self.queue.shutdown(True)
+        if self.settings['worker', 'worker_tasks'] == 0:
+            self.terminate_worker()
+        else:
+            self._worker_done.connect(self.terminate_worker)
+
+    def terminate_worker(self):
         self.exit_runner_thread()
         self.h5saver.flush()
-
         self.enable_runflow_actions(True)
+        self.settings['worker', 'worker_running'] = False
 
     def pause_ramp(self, do_pause=True):
         if do_pause:
             self.ramp_timer.stop()
             self._paused_time = perf_counter()
             for detector in self.detectors:
-                detector.grab_done_signal.disconnect(self.append_data)
-            self.actuator.current_value_signal.disconnect(self.append_data)
+                detector.grab_done_signal.disconnect(self.send_data)
+            self.actuator.current_value_signal.disconnect(self.send_data)
         else:
             self._start_time = perf_counter() - (self._paused_time - self._start_time)
 
             for detector in self.detectors:
-                detector.grab_done_signal.connect(self.append_data)
-            self.actuator.current_value_signal.connect(self.append_data)
+                detector.grab_done_signal.connect(self.send_data)
+            self.actuator.current_value_signal.connect(self.send_data)
             self.ramp_timer.start()
 
     def update_ramp(self):
@@ -393,15 +401,20 @@ class RampExtension(CustomExt):
                              self.settings['ramp', 'stop'],
                              self.settings['ramp', 'duration'],)
 
-    def append_data(self, data: DataToExport | DataActuator):
-        if self.is_action_checked('save'):
-            if isinstance(data, DataActuator):
-                data = DataToExport(data.name, data=[data])
-            try:
-                self.queue.put(data)
-                self.settings['nqueued'] = self.queue.qsize()
-            except queue.ShutDown:
-                pass
+    def send_data(self, dte: DataToExport | DataActuator):
+        if isinstance(dte, DataActuator):
+            dte = DataToExport(dte.name, data=[dte])
+        self.send_data_signal.emit(dte)
+        self._n_emitted += 1
+
+    @QtCore.Slot(int)
+    def update_worker_ntask(self, n_saved: int):
+        n_tasks = self._n_emitted - n_saved
+        self.settings['worker', 'worker_tasks'] = n_tasks
+
+        if n_tasks == 0:
+            self._worker_done.emit()
+
 
     def quit_fun(self):
         super().quit_fun()
