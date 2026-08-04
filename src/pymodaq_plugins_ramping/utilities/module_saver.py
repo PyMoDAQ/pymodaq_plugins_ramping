@@ -20,7 +20,9 @@ class RampSaver(LoggerSaver):
     """
     group_type = GroupModuleType.RAMP
     def __init__(self, module):
-        super().__init__(module)
+        self._module_group: GROUP = None
+        self._module = module
+        self._h5saver = None
 
         self.modules: dict[str, ActuatorTimeSaver |DetectorTimeSaver] = {}
         self.current_nodes: dict[str, Node] = {}

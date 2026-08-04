@@ -1,10 +1,17 @@
 import dataclasses
-
+from pathlib import Path
+import tempfile
+from typing import TYPE_CHECKING
 import numpy as np
 
-from pathlib import Path
+
 
 from qtpy import QtWidgets, QtCore
+
+from pymodaq.extensions.custom_ext import CustomExt
+from pymodaq.utils.managers.modules import ModulesManager
+
+from pymodaq_plugins_ramping.utilities.module_saver import RampSaver
 from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.utils.shared_ui import SharedUI
 from pymodaq_data import DataToExport, DataWithAxes, DataCalculated, Axis
@@ -16,6 +23,9 @@ from pymodaq_gui.qt_utils import mkQApp
 from pymodaq_gui.utils import DockArea, Dock, CustomApp
 from pymodaq_gui.utils.widgets.window import make_window
 from pymodaq_utils.math_utils import find_index
+
+if TYPE_CHECKING:
+    from pymodaq.scripting import Dashboard
 
 
 logger = set_logger(get_module_name(__file__))
@@ -31,10 +41,11 @@ class HistoObject:
     nbins: str | int
 
 
-class HistogramPlot(CustomApp):
+class HistogramPlot(CustomExt):
 
     to_worker = QtCore.Signal(HistoObject)
-
+    module_signal = QtCore.Signal(RampSaver)
+    add_data_signal = QtCore.Signal(DataToExport)
 
     params = [
         {'title': 'H5:', 'name': 'h5info', 'type': 'group', 'children': [
@@ -51,48 +62,61 @@ class HistogramPlot(CustomApp):
 
     ]
     def __init__(self, dockarea: DockArea | None = None,
+                 dashboard: 'Dashboard' = None,
                  title='Histogram',):
 
         super().__init__(dockarea,
+                         dashboard,
                          title=title,
                          create_app_toolbar=False,
                          add_toolbar_break=False)
 
         self._h5saver: H5Saver | str | Path = None
         self.viewer = ViewerDispatcher(dockarea=dockarea)
+
         self.worker = HistoWorker()
 
         self.to_worker.connect(self.worker.compute_histogram)
         self.worker.dte_signal.connect(self.viewer.show_data)
         self.worker.nbins_signal.connect(self.settings.child('histo', 'nbins').setValue)
-
+        self.module_signal.connect(self.worker.update_module_saver)
+        self.add_data_signal.connect(self.worker.add_data)
         self.runner_thread = QtCore.QThread()
         self.worker.moveToThread(self.runner_thread)
         self.runner_thread.start()
 
+    def create_temp_h5_saver(self):
+        self._h5saver = H5Saver()
+        self.temp_path = tempfile.TemporaryDirectory(prefix='pymohisto')
+        addhoc_file_path = Path(self.temp_path.name).joinpath('temp_data.h5')
+        self._h5saver.init_file(custom_naming=True, addhoc_file_path=addhoc_file_path)
+
+        self.module_and_data_saver = RampSaver(self)
+        self.module_signal.emit(self.module_and_data_saver)
+
     def update_h5_saver(self, h5saver: H5Saver | str | Path,
                         node: str = 'RawData/Ramp000'):
-        self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
         if isinstance(h5saver, H5Saver):
             self.settings['h5info', 'h5path'] = str(h5saver.file_path)
 
         else:
             self.settings['h5info', 'h5path'] = str(h5saver)
         self._h5saver = h5saver
-        nodes = []
-        with DataLoader(h5saver, swmr_mode=True) as dl:
-            for ind, _node in enumerate(dl.walk_nodes('/RawData', depth=1, only_groups=True)):
-                if ind > 0:
-                    nodes.append(_node.path)
-        with self.settings.child('h5info', 'node_path').treeChangeBlocker():
-            self.settings.child('h5info', 'node_path').setOpts(value=node, limits=nodes)
-        self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
+        self.update_node(node)
 
-    def update_node(self, node_name: str | Node):
+    def update_node(self, node_name: str | Node = None,):
         if isinstance(node_name, Node):
             node_name = node_name.path
         self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
-        self.settings.child('h5info', 'node_path').setValue(node_name)
+        nodes = []
+        with DataLoader(self.h5saver, swmr_mode=True) as dl:
+            for ind, _node in enumerate(dl.walk_nodes('/RawData', depth=1, only_groups=True)):
+                if ind > 0:
+                    nodes.append(_node.path)
+        if node_name is None or node_name not in nodes:
+            node_name = nodes[0]
+        with self.settings.child('h5info', 'node_path').treeChangeBlocker():
+            self.settings.child('h5info', 'node_path').setOpts(value=node_name, limits=nodes)
         self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
 
     def value_changed(self, param: Parameter):
@@ -118,6 +142,7 @@ class HistogramPlot(CustomApp):
                         'auto' if self.settings['histo', 'autobin'] else self.settings['histo', 'nbins']))
 
 
+
 class HistoWorker(QtCore.QObject):
 
     dte_signal = QtCore.Signal(DataToExport)
@@ -125,13 +150,26 @@ class HistoWorker(QtCore.QObject):
 
     def __init__(self):
         super().__init__()
+        self.module_saver: RampSaver = None
+
+    @QtCore.Slot(RampSaver)
+    def update_module_saver(self, module: RampSaver):
+        self.module_saver = module
+
+    @QtCore.Slot(DataToExport)
+    def add_data(self, dte: DataToExport):
+        self.module_saver.add_data(dte)
 
     @QtCore.Slot(HistoObject)
     def compute_histogram(self, histo_obj: HistoObject) -> DataToExport:
         axis_name = histo_obj.axis_name
         dte_out = DataToExport('Histogram')
         logger.info('computing histogram')
-        with DataLoader(histo_obj.h5saver, swmr_mode=True) as dl:
+        if True:
+            saver = self.module_saver.h5saver
+        else:
+            saver = histo_obj.h5saver
+        with DataLoader(saver, swmr_mode=True) as dl:
             dte = dl.load_all(where=histo_obj.node_path)
         if axis_name not in dte.get_names():
             self.dte_signal.emit(dte_out)

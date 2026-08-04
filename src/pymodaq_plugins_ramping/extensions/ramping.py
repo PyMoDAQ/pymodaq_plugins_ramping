@@ -93,7 +93,7 @@ class RampExtension(CustomExt):
 
 
     def __init__(self, parent: gutils.DockArea, dashboard):
-        self.histogramer = HistogramPlot(dockarea=parent)
+        self.histogramer = HistogramPlot(dockarea=parent, dashboard=dashboard)
 
         super().__init__(parent, dashboard, add_toolbar_break=False)
 
@@ -248,8 +248,15 @@ class RampExtension(CustomExt):
         if self.is_action_checked('save'):
             self.setup_saving()
             self.current_node = self.module_and_data_saver.get_last_node('/RawData')
-            self.histogramer.update_h5_saver(self.h5saver.file_path)
-            self.histogramer.update_node(self.current_node)
+
+            if True:
+                self.histogramer.create_temp_h5_saver()
+                self.histogramer.module_and_data_saver.get_set_node(new=True)
+                current_node = self.module_and_data_saver.get_last_node('/RawData')
+            else:
+                self.histogramer.update_h5_saver(self.h5saver.file_path)
+
+            self.histogramer.update_node(current_node)
             self.histogramer_timer.setInterval(int(self.settings['refresh_plot']))
 
         self._n_emitted = 0
@@ -294,7 +301,7 @@ class RampExtension(CustomExt):
             self.total_ramp_timer.start()
         if self.is_action_checked('save'):
             pass
-            #self.histogramer_timer.start()
+            self.histogramer_timer.start()
         self.enable_runflow_actions(False, excepted=('pause', 'stop'))
 
     def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
@@ -315,7 +322,7 @@ class RampExtension(CustomExt):
     def stop_ramp(self):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
-        #self.histogramer_timer.stop()
+        self.histogramer_timer.stop()
 
         for detector in self.detectors:
             try:
@@ -349,7 +356,7 @@ class RampExtension(CustomExt):
     def pause_ramp(self, do_pause=True):
         if do_pause:
             self.ramp_timer.stop()
-            #self.histogramer_timer.stop()
+            self.histogramer_timer.stop()
             self._paused_time = perf_counter()
             for detector in self.detectors:
                 detector.grab_done_signal.disconnect(self.send_data)
@@ -362,7 +369,7 @@ class RampExtension(CustomExt):
             self.actuator.current_value_signal.connect(self.send_data)
             self.ramp_timer.start()
             if self.is_action_checked('save'):
-                #self.histogramer_timer.start()
+                self.histogramer_timer.start()
                 pass
 
     def update_ramp(self):
@@ -448,6 +455,7 @@ class RampExtension(CustomExt):
             if isinstance(dte, DataActuator):
                 dte = DataToExport(dte.name, data=[dte])
             self.send_data_signal.emit(dte)
+            self.histogramer.add_data_signal.emit(dte)
             self._n_emitted += 1
 
     @QtCore.Slot(int)
