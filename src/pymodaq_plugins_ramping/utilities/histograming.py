@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 
 from qtpy import QtWidgets, QtCore
-
+from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.utils.shared_ui import SharedUI
 from pymodaq_data import DataToExport, DataWithAxes, DataCalculated, Axis
 from pymodaq_data.h5modules.data_saving import DataLoader, Node
@@ -18,9 +18,12 @@ from pymodaq_gui.utils.widgets.window import make_window
 from pymodaq_utils.math_utils import find_index
 
 
+logger = set_logger(get_module_name(__file__))
+
+
 @dataclasses.dataclass
 class HistoObject:
-    h5saver: H5Saver
+    h5saver: H5Saver | str | Path
     node_path: str | Node
     axis_name: str
     start: float
@@ -36,7 +39,7 @@ class HistogramPlot(CustomApp):
     params = [
         {'title': 'H5:', 'name': 'h5info', 'type': 'group', 'children': [
             {'title': 'H5 Path:', 'name': 'h5path', 'type': 'str', 'value': '', 'readonly': True},
-            {'title': 'Node:', 'name': 'node_path', 'type': 'str', 'value': '', 'readonly': True},
+            {'title': 'Node:', 'name': 'node_path', 'type': 'list', 'limits': [], 'readonly': True},
             {'title': 'Actuator:', 'name': 'actuator', 'type': 'str', 'value': '', 'readonly': True},
         ]},
         {'title': 'Histo:', 'name': 'histo', 'type': 'group', 'children': [
@@ -47,40 +50,66 @@ class HistogramPlot(CustomApp):
             ]},
 
     ]
-    def __init__(self, h5saver: Path | str = None,
-                 dockarea: DockArea | None = None,
-                 title='Histogram'):
+    def __init__(self, dockarea: DockArea | None = None,
+                 title='Histogram',):
 
-        super().__init__(dockarea, title=title)
-        self.settings['h5info', 'h5path'] = str(h5saver)
+        super().__init__(dockarea, title=title, create_app_toolbar=False, add_toolbar_break=False)
 
+        self._h5saver: H5Saver | str | Path = None
         self.viewer = ViewerDispatcher(dockarea=dockarea)
         self.worker = HistoWorker()
+        self.runner_thread = QtCore.QThread()
+        self.worker.moveToThread(self.runner_thread)
+
         self.to_worker.connect(self.worker.compute_histogram)
         self.worker.dte_signal.connect(self.viewer.show_data)
         self.worker.nbins_signal.connect(self.settings.child('histo', 'nbins').setValue)
 
-    def update_h5_saver(self, h5saver: H5Saver):
+        self.runner_thread.start()
+
+    def update_h5_saver(self, h5saver: H5Saver | str | Path,
+                        node: str = 'RawData/Ramp000'):
+        self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
+        if isinstance(h5saver, H5Saver):
+            self.settings['h5info', 'h5path'] = str(h5saver.file_path)
+
+        else:
+            self.settings['h5info', 'h5path'] = str(h5saver)
         self._h5saver = h5saver
+        nodes = []
+        with DataLoader(h5saver, swmr_mode=True) as dl:
+            for ind, _node in enumerate(dl.walk_nodes('/RawData', depth=1, only_groups=True)):
+                if ind > 0:
+                    nodes.append(_node.path)
+        with self.settings.child('h5info', 'node_path').treeChangeBlocker():
+            self.settings.child('h5info', 'node_path').setOpts(value=node, limits=nodes)
+        self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
+
+    def update_node(self, node_name: str | Node):
+        if isinstance(node_name, Node):
+            node_name = node_name.path
+        self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
+        self.settings.child('h5info', 'node_path').setValue(node_name)
+        self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
 
     def value_changed(self, param: Parameter):
         if param.name() == 'autobin':
             self.settings.child('histo', 'nbins').setOpts(readonly=param.value())
             if param.value():
-                self.compute_plot_histogram(self.settings['h5info', 'node_path'],
-                                            self.settings['h5info', 'actuator'])
+                self.compute_plot_histogram(self.settings['h5info', 'actuator'])
         elif (param.name() == 'nbins' and not self.settings['histo', 'autobin']
             ):
-            self.compute_plot_histogram(self.settings['h5info', 'node_path'],
-                                        self.settings['h5info', 'actuator'])
+            self.compute_plot_histogram(self.settings['h5info', 'actuator'])
+        elif param.name() == 'node_path':
+            self.compute_plot_histogram(self.settings['h5info', 'actuator'])
 
-    def compute_plot_histogram(self, node: str| Node, xaxis_name: str):
-        self.settings['h5info', 'node_path'] = str(node)
+    def compute_plot_histogram(self, xaxis_name: str):
         self.settings['h5info', 'actuator'] = xaxis_name
 
         self.to_worker.emit(
-            HistoObject(self.settings['h5info', 'h5path'],
-                        node, xaxis_name,
+            HistoObject(self._h5saver,
+                        self.settings['h5info', 'node_path'],
+                        xaxis_name,
                         self.settings['histo', 'start'],
                         self.settings['histo', 'stop'],
                         'auto' if self.settings['histo', 'autobin'] else self.settings['histo', 'nbins']))
@@ -98,7 +127,7 @@ class HistoWorker(QtCore.QObject):
     def compute_histogram(self, histo_obj: HistoObject) -> DataToExport:
         axis_name = histo_obj.axis_name
         dte_out = DataToExport('Histogram')
-
+        logger.info('computing histogram')
         with DataLoader(histo_obj.h5saver, swmr_mode=True) as dl:
             dte = dl.load_all(where=histo_obj.node_path)
         if axis_name not in dte.get_names():
@@ -167,15 +196,18 @@ class HistoWorker(QtCore.QObject):
 if __name__ == '__main__':
     app = mkQApp('Histogram')
 
-    file_path = r'C:\Data\2026\20260803\Dataset_20260803_065.h5'
+    file_path = r'C:\Data\2026\20260804\Dataset_20260804_008.h5'
 
     win, area = make_window(title='Histogram', flags=None)
-    histo = HistogramPlot(file_path, dockarea=area)
+    histo = HistogramPlot(dockarea=area)
+    histo.settings.child('h5info', 'node_path').setOpts(readonly=False)
+    histo.update_h5_saver(file_path)
+
     dock_settings = Dock('Settings')
     dock_settings.addWidget(histo.settings_tree)
     area.addDock(dock_settings)
     shared_ui = SharedUI(win)
     shared_ui.affect_application(histo)
-    histo.compute_plot_histogram('/RawData/Ramp003', 'Wavelength')
+    histo.compute_plot_histogram('Wavelength')
 
     app.exec()
