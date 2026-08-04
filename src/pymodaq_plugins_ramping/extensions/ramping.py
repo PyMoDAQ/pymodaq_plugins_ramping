@@ -297,7 +297,8 @@ class RampExtension(CustomExt):
 
             self.total_ramp_timer.start()
         if self.is_action_checked('save'):
-            self.histogramer_timer.start()
+            pass
+            #self.histogramer_timer.start()
         self.enable_runflow_actions(False, excepted=('pause', 'stop'))
 
     def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
@@ -318,7 +319,7 @@ class RampExtension(CustomExt):
     def stop_ramp(self):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
-        self.histogramer_timer.stop()
+        #self.histogramer_timer.stop()
 
         for detector in self.detectors:
             try:
@@ -347,11 +348,12 @@ class RampExtension(CustomExt):
         self.update_file_status_led()
         self.enable_runflow_actions(True)
         self.settings['worker', 'worker_running'] = False
+        self.update_histogramer()
 
     def pause_ramp(self, do_pause=True):
         if do_pause:
             self.ramp_timer.stop()
-            self.histogramer_timer.stop()
+            #self.histogramer_timer.stop()
             self._paused_time = perf_counter()
             for detector in self.detectors:
                 detector.grab_done_signal.disconnect(self.send_data)
@@ -364,7 +366,8 @@ class RampExtension(CustomExt):
             self.actuator.current_value_signal.connect(self.send_data)
             self.ramp_timer.start()
             if self.is_action_checked('save'):
-                self.histogramer_timer.start()
+                #self.histogramer_timer.start()
+                pass
 
     def update_ramp(self):
         if self._start_time is None:

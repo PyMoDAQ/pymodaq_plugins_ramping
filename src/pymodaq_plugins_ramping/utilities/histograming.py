@@ -53,18 +53,21 @@ class HistogramPlot(CustomApp):
     def __init__(self, dockarea: DockArea | None = None,
                  title='Histogram',):
 
-        super().__init__(dockarea, title=title, create_app_toolbar=False, add_toolbar_break=False)
+        super().__init__(dockarea,
+                         title=title,
+                         create_app_toolbar=False,
+                         add_toolbar_break=False)
 
         self._h5saver: H5Saver | str | Path = None
         self.viewer = ViewerDispatcher(dockarea=dockarea)
         self.worker = HistoWorker()
-        self.runner_thread = QtCore.QThread()
-        self.worker.moveToThread(self.runner_thread)
 
         self.to_worker.connect(self.worker.compute_histogram)
         self.worker.dte_signal.connect(self.viewer.show_data)
         self.worker.nbins_signal.connect(self.settings.child('histo', 'nbins').setValue)
 
+        self.runner_thread = QtCore.QThread()
+        self.worker.moveToThread(self.runner_thread)
         self.runner_thread.start()
 
     def update_h5_saver(self, h5saver: H5Saver | str | Path,
