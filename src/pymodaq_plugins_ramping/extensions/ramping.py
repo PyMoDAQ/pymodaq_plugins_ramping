@@ -5,6 +5,7 @@ from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
 from qtpy import QtWidgets, QtCore
 
+from pymodaq_data import Q_
 
 from pymodaq.control_modules.thread_commands import ControlToHardwareMove
 from pymodaq.utils.data import DataActuator
@@ -16,7 +17,7 @@ from pymodaq_gui.utils import DockArea, Dock
 
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
 from pymodaq_plugins_ramping.utilities.histograming import HistogramPlot
-from pymodaq_plugins_ramping.utilities.module_saver import RampSaver
+from pymodaq_plugins_ramping.utilities.module_saver import RampSaver, GROUP
 from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
 
@@ -70,7 +71,10 @@ class RampExtension(CustomExt):
     params = [
         {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
-        {'title': 'Grab Step:', 'name': 'grab_step', 'type': 'float', 'value': 0.1, 'suffix': 's', 'siPrefix': True},
+        {'title': 'Refresh Grab:', 'name': 'refresh_grab', 'type': 'float', 'value': 50, 'suffix': 'ms',
+         'siPrefix': False},
+        {'title': 'Refresh Plot:', 'name': 'refresh_plot', 'type': 'float', 'value': 500, 'suffix': 'ms',
+         'siPrefix': False},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
@@ -80,7 +84,8 @@ class RampExtension(CustomExt):
         ]},
         {'title': 'Use Steps:', 'name': 'use_steps', 'type': 'bool', 'value': True},
         {'title': 'Steps:', 'name': 'steps', 'type': 'group', 'children': [
-            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 0.2, 'suffix': 's', 'siPrefix': True},
+            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 200, 'suffix': 'ms',
+             'siPrefix': False},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
         ]},
@@ -92,7 +97,9 @@ class RampExtension(CustomExt):
 
 
     def __init__(self, parent: gutils.DockArea, dashboard):
-        super().__init__(parent, dashboard)
+        self.histogramer = HistogramPlot(dockarea=parent)
+
+        super().__init__(parent, dashboard, add_toolbar_break=False)
 
         self._start_time: float = None
         self._paused_time: float = None
@@ -106,19 +113,19 @@ class RampExtension(CustomExt):
         self.total_ramp_timer = QtCore.QTimer()
         self.total_ramp_timer.timeout.connect(self.stop_ramp)
 
+        self.histogramer_timer = QtCore.QTimer()
+        self.histogramer_timer.timeout.connect(self.update_histogramer)
+
         self._actuator: 'DAQ_Move' = None
 
         self._module_and_data_saver = RampSaver(self)
-
+        self.current_node: GROUP | str = None
         self.setup_ui()
 
         self.update_n_steps()
         self.update_velocity()
 
-        self.histogramer = HistogramPlot(dockarea=parent)
-
         self.enable_runflow_actions(False)
-
 
     def setup_saving(self):
         node_name = self.module_and_data_saver.get_set_node(new=True)
@@ -133,7 +140,11 @@ class RampExtension(CustomExt):
         self.saving_dock = Dock('Saving')
         self.saving_dock.addWidget(self.h5saver.settings_tree)
 
+        self.histogramer_dock = Dock('Histogram')
+        self.histogramer_dock.addWidget(self.histogramer.settings_tree)
+
         self.dockarea.addDock(self.settings_dock, 'left')
+        self.dockarea.addDock(self.histogramer_dock, 'bottom', self.settings_dock)
         self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
         self.saving_dock.setVisible(False)
         self.populate_status_bar()
@@ -218,6 +229,9 @@ class RampExtension(CustomExt):
         self.actuator.move_done_signal.connect(self.start_ramp)
         self.go_to_ini_ramp()
 
+    def update_histogramer(self):
+        self.histogramer.compute_plot_histogram(self.settings['actuator'])
+
     def start_ramp(self):
         try:
             self.actuator.move_done_signal.disconnect(self.start_ramp)
@@ -230,20 +244,24 @@ class RampExtension(CustomExt):
             pass
 
         if self.settings['use_steps']:
-            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step'] * 1000))
+            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step']))
 
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
 
         if self.is_action_checked('save'):
             self.setup_saving()
+            self.current_node = self.module_and_data_saver.get_last_node('/RawData')
+            self.histogramer.update_h5_saver(self.h5saver.file_path)
+            self.histogramer.update_node(self.current_node)
+            self.histogramer_timer.setInterval(int(self.settings['refresh_plot']))
 
         self._n_emitted = 0
 
         for detector in self.detectors:
-            detector.settings['main_settings', 'wait_time'] = self.settings['grab_step'] * 1000
+            detector.settings['main_settings', 'wait_time'] = self.settings['refresh_grab']
 
-        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['grab_step'] * 1000
+        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
 
         if self.runner_thread is not None and self.runner_thread.isRunning():
             self.exit_runner_thread()
@@ -278,7 +296,8 @@ class RampExtension(CustomExt):
                 ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
 
             self.total_ramp_timer.start()
-
+        if self.is_action_checked('save'):
+            self.histogramer_timer.start()
         self.enable_runflow_actions(False, excepted=('pause', 'stop'))
 
     def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
@@ -299,6 +318,7 @@ class RampExtension(CustomExt):
     def stop_ramp(self):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
+        self.histogramer_timer.stop()
 
         for detector in self.detectors:
             try:
@@ -331,6 +351,7 @@ class RampExtension(CustomExt):
     def pause_ramp(self, do_pause=True):
         if do_pause:
             self.ramp_timer.stop()
+            self.histogramer_timer.stop()
             self._paused_time = perf_counter()
             for detector in self.detectors:
                 detector.grab_done_signal.disconnect(self.send_data)
@@ -342,6 +363,8 @@ class RampExtension(CustomExt):
                 detector.grab_done_signal.connect(self.send_data)
             self.actuator.current_value_signal.connect(self.send_data)
             self.ramp_timer.start()
+            if self.is_action_checked('save'):
+                self.histogramer_timer.start()
 
     def update_ramp(self):
         if self._start_time is None:
@@ -407,7 +430,8 @@ class RampExtension(CustomExt):
             self.update_velocity()
 
     def update_n_steps(self):
-        self.settings['steps', 'nsteps'] = self.settings['ramp', 'duration'] / self.settings['steps', 'time_step']
+        self.settings['steps', 'nsteps'] = (Q_(self.settings['ramp', 'duration'], 's') /
+                                            Q_(self.settings['steps', 'time_step'], 'ms').to('s')).magnitude
 
     def update_velocity(self):
         if self.actuator is not None:
@@ -438,8 +462,8 @@ class RampExtension(CustomExt):
     def quit_fun(self):
         self.h5saver.flush()
         self.h5saver.close()
+        self.histogramer.quit_fun()
         super().quit_fun()
-
 
 
 def main():
