@@ -5,7 +5,7 @@ from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
 from qtpy import QtWidgets, QtCore
 
-from pymodaq_data import Q_
+from pymodaq_data import Q_, DataDim, DataSource
 
 from pymodaq.control_modules.thread_commands import ControlToHardwareMove
 from pymodaq.utils.data import DataActuator
@@ -53,9 +53,12 @@ class SaverWorker(QtCore.QObject):
 
     @QtCore.Slot(DataToExport)
     def save_data(self, dte: DataToExport):
+
         self.module.add_data(dte)
         self._n_saved += 1
         self.n_saved.emit(self._n_saved)
+
+
 
 
 class RampExtension(CustomExt):
@@ -65,8 +68,9 @@ class RampExtension(CustomExt):
     _h5_base_group_name = 'Ramp'
     _show_h5file_widgets = True
     params = [
-        {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', },
-        {'title': 'Detectors:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
+        {'title': 'Ramping Actuator:', 'name': 'actuator', 'type': 'list', },
+        {'title': 'Detectors to save:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
+        {'title': 'Actuators to save:', 'name': 'actuators', 'type': 'itemselect', 'checkbox': True},
         {'title': 'Refresh Grab:', 'name': 'refresh_grab', 'type': 'float', 'value': 50, 'suffix': 'ms',
          'siPrefix': False},
         {'title': 'Refresh Plot:', 'name': 'refresh_plot', 'type': 'float', 'value': 500, 'suffix': 'ms',
@@ -148,11 +152,21 @@ class RampExtension(CustomExt):
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
         self.settings.child('actuator').setLimits(self.modules_manager.actuators_name)
-        self.settings['detectors'] = dict(all_items=self.modules_manager.detectors_name,
-                                          selected=[])
+        self.display_control_modules()
 
         self.enable_runflow_actions(True)
         self._module_and_data_saver = RampSaver(self)
+
+    def display_control_modules(self):
+        selected = self.settings['detectors']['selected']
+        self.settings['detectors'] = dict(all_items=self.modules_manager.detectors_name,
+                                          selected=selected)
+        actuators = self.modules_manager.actuators_name[:]
+        selected = self.settings['actuators']['selected']
+        if self.settings['actuator'] in actuators:
+            actuators.remove(self.settings['actuator'])
+        self.settings['actuators'] = dict(all_items=actuators,
+                                          selected=selected)
 
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
@@ -256,7 +270,8 @@ class RampExtension(CustomExt):
 
         for detector in self.detectors:
             detector.settings['main_settings', 'wait_time'] = self.settings['refresh_grab']
-
+        for actuator in self.actuators:
+            actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
         self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
 
         if self.runner_thread is not None and self.runner_thread.isRunning():
@@ -278,6 +293,9 @@ class RampExtension(CustomExt):
         for detector in self.detectors:
             detector.grab_done_signal.connect(self.send_data)
             detector.grab_data(True)
+        for actuator in self.actuators:
+            actuator.current_value_signal.connect(self.send_data)
+            actuator.get_continuous_actuator_value(get_value=True)
         self.actuator.current_value_signal.connect(self.send_data)
         self.actuator.get_continuous_actuator_value(get_value=True)
 
@@ -312,6 +330,16 @@ class RampExtension(CustomExt):
                 detectors.append(det)
         return detectors
 
+    @property
+    def actuators(self) -> Iterable['DAQ_Move']:
+        actuators = []
+        for actuator in self.settings['actuators']['selected']:
+            act = self.modules_manager.get_mod_from_name(actuator,
+                                                         mod=ModuleType.Actuator)
+            if act is not None:
+                actuators.append(act)
+        return actuators
+
     def stop_ramp(self):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
@@ -323,11 +351,18 @@ class RampExtension(CustomExt):
             except TypeError:
                 pass
             detector.grab_data(False)
+
+        for actuator in self.actuators:
+            try:
+                actuator.current_value_signal.disconnect(self.send_data)
+
+            except TypeError:
+                pass
+            actuator.get_continuous_actuator_value(get_value=False)
         try:
             self.actuator.current_value_signal.disconnect(self.send_data)
         except TypeError:
             pass
-
         self.actuator.get_continuous_actuator_value(get_value=False)
 
         self._start_time = None
@@ -353,12 +388,16 @@ class RampExtension(CustomExt):
             self._paused_time = perf_counter()
             for detector in self.detectors:
                 detector.grab_done_signal.disconnect(self.send_data)
+            for actuator in self.actuators:
+                actuator.current_value_signal.disconnect(self.send_data)
             self.actuator.current_value_signal.disconnect(self.send_data)
         else:
             self._start_time = perf_counter() - (self._paused_time - self._start_time)
 
             for detector in self.detectors:
                 detector.grab_done_signal.connect(self.send_data)
+            for actuator in self.actuators:
+                actuator.current_value_signal.connect(self.send_data)
             self.actuator.current_value_signal.connect(self.send_data)
             self.ramp_timer.start()
             if self.is_action_checked('save'):
@@ -380,10 +419,6 @@ class RampExtension(CustomExt):
 
         if elapsed_time > self.settings['ramp', 'duration']:
             self.stop_ramp()
-
-    @property
-    def actuators(self) -> Iterable['DAQ_Move']:
-            return self.modules_manager.actuators_all
 
     @property
     def actuators_name(self) -> Iterable[str]:
@@ -422,6 +457,7 @@ class RampExtension(CustomExt):
             self.update_n_steps()
         elif param.name() == 'actuator':
             self._actuator: 'DAQ_Move' = None
+            self.display_control_modules()
             self.update_ramp_settings()
         elif param.name() == 'use_steps':
             self.settings.child('steps').show(param.value())
@@ -447,8 +483,25 @@ class RampExtension(CustomExt):
         if self.is_action_checked('save'):
             if isinstance(dte, DataActuator):
                 dte = DataToExport(dte.name, data=[dte])
-            self.send_data_signal.emit(dte)
+
+            # filtering dwa to be saved
+            dte_filtered = DataToExport(dte.name)
+            for dwa in dte:
+                if 'do_save' in dwa.extra_attributes and dwa.do_save:
+                    dte_filtered.append(dwa)
+                elif self.filter_data_wrt_settings(dwa):
+                    dte_filtered.append(dwa)
+
+            self.send_data_signal.emit(dte_filtered)
             self._n_emitted += 1
+
+    def filter_data_wrt_settings(self, dwa: DataWithAxes):
+        flag = True
+        if not self.h5saver.settings['save_2D']:  # exclude 2D data and above
+            flag = flag and not (dwa.dim == DataDim.Data2D or dwa.dim == DataDim.DataND)
+        if self.h5saver.settings['save_raw_only']:  # exclude Calculated data
+            flag = flag and dwa.source == DataSource.raw
+        return flag
 
     @QtCore.Slot(int)
     def update_worker_ntask(self, n_saved: int):
