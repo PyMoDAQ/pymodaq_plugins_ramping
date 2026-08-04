@@ -15,6 +15,7 @@ from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.utils import DockArea, Dock
 
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
+from pymodaq_plugins_ramping.utilities.histograming import HistogramPlot
 from pymodaq_plugins_ramping.utilities.module_saver import RampSaver
 from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
@@ -114,7 +115,10 @@ class RampExtension(CustomExt):
         self.update_n_steps()
         self.update_velocity()
 
+        self.histogramer = HistogramPlot(dockarea=parent)
+
         self.enable_runflow_actions(False)
+
 
     def setup_saving(self):
         node_name = self.module_and_data_saver.get_set_node(new=True)
