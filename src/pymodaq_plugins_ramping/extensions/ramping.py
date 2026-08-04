@@ -41,6 +41,9 @@ CLASS_NAME = 'RampExtension'  # this should be the name of your class defined be
 
 
 class SaverWorker(QtCore.QObject):
+    """ Worker in separated thread receiving the data from the control modules
+    and adding them into the enlargeable arrays with the H5file. All this through the
+    RampSaver ModuleSaver """
     n_saved = QtCore.Signal(int)
 
     def __init__(self, module: RampSaver):
@@ -48,18 +51,11 @@ class SaverWorker(QtCore.QObject):
         self.module: RampSaver = module
         self._n_saved = 0
 
-        # self.n_saved_timer = QtCore.QTimer()
-        # self.n_saved_timer.setInterval(100)
-        # self.n_saved_timer.timeout.connect(self.send_n_saved)
-
     @QtCore.Slot(DataToExport)
     def save_data(self, dte: DataToExport):
         self.module.add_data(dte)
         self._n_saved += 1
         self.n_saved.emit(self._n_saved)
-
-    # def send_n_saved(self):
-    #     self.n_saved.emit(self._n_saved)
 
 
 class RampExtension(CustomExt):
