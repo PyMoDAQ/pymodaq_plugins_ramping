@@ -175,6 +175,7 @@ class RampExtension(CustomExt):
         self.add_menu(MenuToolbarNames.TOOLS, MenuToolbarNames.TOOLS.capitalize(), parent_menu=menubar)
         self.add_menu('actions', 'Actions', parent_menu=menubar)
 
+
     def do_things_after_ui_setup(self):
         self.create_dashboard_toolbar(add_break=False)
 
@@ -212,6 +213,7 @@ class RampExtension(CustomExt):
         self.add_action('show_saving', 'Show Saving Options', 'settings',
                         menu=MenuToolbarNames.TOOLS, checkable=True,
                         toolbar=self.toolbar, tip='Display in a Dock the Saving Settings')
+        self.histogramer.set_action_visible('show_saving', False)
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
@@ -262,8 +264,10 @@ class RampExtension(CustomExt):
         if self.is_action_checked('save'):
             self.setup_saving()
             self.current_node = self.module_and_data_saver.get_last_node('/RawData')
-            self.histogramer.update_h5_saver(self.h5saver.file_path)
-            self.histogramer.update_node(self.current_node)
+            self.histogramer.update_h5_saver(self.h5saver.file_path,
+                                             node=self.current_node,
+                                             actuator=self.settings['actuator'],
+                                             )
             self.histogramer_timer.setInterval(int(self.settings['refresh_plot']))
 
         self._n_emitted = 0
@@ -516,6 +520,13 @@ class RampExtension(CustomExt):
         self.h5saver.close()
         self.histogramer.quit_fun()
         super().quit_fun()
+
+    def get_app_toolbars(self) -> list[QtWidgets.QToolBar]:
+        """ Get the main toolbars widget to be eventually added in the main window toolbararea
+
+        Default is the default toolbar. To be reimplemented if needed
+        """
+        return [self.toolbar, self.histogramer.toolbar]
 
 
 def main():

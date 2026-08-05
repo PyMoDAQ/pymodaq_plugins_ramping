@@ -5,15 +5,18 @@ import numpy as np
 from pathlib import Path
 
 from qtpy import QtWidgets, QtCore
+
+from pymodaq_gui.utils.shared_ui import MenuToolbarNames
+from pymodaq_gui.parameter.ioxml import parameter_to_xml_string
 from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.utils.shared_ui import SharedUI
 from pymodaq_data import DataToExport, DataWithAxes, DataCalculated, Axis, DataDistribution
-from pymodaq_data.h5modules.data_saving import DataLoader, Node
+from pymodaq_data.h5modules.data_saving import DataLoader, Node, DataToExportSaver
 from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.managers.parameter_manager import ParameterManager, Parameter
 from pymodaq_gui.plotting.data_viewers import ViewerDispatcher
 from pymodaq_gui.qt_utils import mkQApp
-from pymodaq_gui.utils import DockArea, Dock, CustomApp
+from pymodaq_gui.utils import DockArea, Dock, CustomApp, select_file
 from pymodaq_gui.utils.widgets.window import make_window
 from pymodaq_utils.math_utils import find_index
 
@@ -60,11 +63,12 @@ class HistogramPlot(CustomApp):
                          add_toolbar_break=False)
 
         self._h5saver: H5Saver | str | Path = None
+        self._current_dte: DataToExport = None
         self.viewer = ViewerDispatcher(dockarea=dockarea)
         self.worker = HistoWorker()
 
         self.to_worker.connect(self.worker.compute_histogram)
-        self.worker.dte_signal.connect(self.viewer.show_data)
+        self.worker.dte_signal.connect(self.plot_data)
         self.worker.nbins_signal.connect(self.settings.child('histo', 'nbins').setValue)
 
         if with_threading:
@@ -74,8 +78,22 @@ class HistogramPlot(CustomApp):
 
         self.setup_ui()
 
+    def plot_data(self, dte: DataToExport):
+        self._current_dte = dte
+        self.viewer.show_data(dte)
+        self.set_action_enabled('save', True)
+
+    def save_computed_data(self):
+        Path(self.h5saver.settings['base_path']).mkdir(exist_ok=True)
+        filename = select_file(self.h5saver.settings['base_path'], save=True, ext='h5')
+        if filename is not None and filename != '':
+            with DataToExportSaver(filename, new_file=True) as saver:
+                saver.add_data('/RawData', self._current_dte,
+                               settings_as_xml=parameter_to_xml_string(self.settings))
+
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
-        pass
+        self.add_menu(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(),
+                      parent_menu=menubar)
 
     def setup_docks_and_widgets(self):
         pass
@@ -84,11 +102,17 @@ class HistogramPlot(CustomApp):
         self.add_action('show_file', 'Show file content', 'folder_data',
                         tip='Browse the content of the current HDF5 file')
 
+        self.add_action('save', 'Save Computed Data', 'save',
+                        menu=MenuToolbarNames.FILE, enabled=False)
+
     def connect_things(self):
         self.connect_action('show_file', self.show_file_content)
+        self.connect_action('save', self.save_computed_data)
 
     def update_h5_saver(self, h5saver: H5Saver | str | Path,
-                        node: str = 'RawData/Ramp000'):
+                        node: str = 'RawData/Ramp000',
+                        actuator: str = None,
+                        ):
         self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
         if isinstance(h5saver, H5Saver):
             self.settings['h5info', 'h5path'] = str(h5saver.file_path)
@@ -98,7 +122,7 @@ class HistogramPlot(CustomApp):
             self._h5saver = H5Saver()
             self._h5saver.init_file(addhoc_file_path=h5saver)
         self.update_node(node)
-        self.update_actuator()
+        self.update_actuator(actuator)
 
     def update_node(self, node_name: str | Node = None):
         if isinstance(node_name, Node):
@@ -112,14 +136,24 @@ class HistogramPlot(CustomApp):
             self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
         except TypeError:
             pass
-        if node_name is None or node_name not in nodes:
-            node_name = nodes[0]
+        if len(nodes) == 0:
+            if node_name is None:
+                return
+            else:
+                nodes = [node_name]
+        else:
+            if node_name is None:
+                node_name = nodes[0]
         with self.settings.child('h5info', 'node_path').treeChangeBlocker():
             self.settings.child('h5info', 'node_path').setOpts(value=node_name, limits=nodes)
-        self.settings['histo', 'nbins'] = self.check_min_axis_size()
+        bin_size = self.check_min_axis_size()
+        if bin_size is None:
+            self.settings['histo', 'autobin'] = True
+        else:
+            self.settings['histo', 'nbins'] = bin_size
         self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
 
-    def check_min_axis_size(self) -> int:
+    def check_min_axis_size(self) -> int | None:
         """ Look at the arrays under current node for the minimal navigation size"""
         min_size = None
         with DataLoader(self.h5saver, swmr_mode=True) as dl:
@@ -130,6 +164,7 @@ class HistogramPlot(CustomApp):
                     else:
                         min_size = min(min_size, node.attrs['shape'][0])
         return min_size
+
     def update_actuator(self, actuator: str = None):
         actuators = []
         with DataLoader(self.h5saver, swmr_mode=True) as dl:
@@ -137,6 +172,14 @@ class HistogramPlot(CustomApp):
                 if ('type' in node.attrs and node.attrs['type'] == 'actuator' and
                 len(node.children()) > 0):
                     actuators.append(node.title)
+        if len(actuators) == 0:
+            if actuator is None:
+                return
+            else:
+                actuators = [actuator]
+        else:
+            if actuator is None:
+                actuator = actuators[0]
         try:
             self._settings.sigTreeStateChanged.disconnect(self.parameter_tree_changed)
         except TypeError:
@@ -286,7 +329,7 @@ class HistoWorker(QtCore.QObject):
 if __name__ == '__main__':
     app = mkQApp('Histogram')
 
-    file_path = r'C:\Data\2026\20260804\Dataset_20260804_040.h5'
+    file_path = r'C:\Data\2026\20260805\Dataset_20260805_005.h5'
 
     win, area = make_window(title='Histogram', flags=None)
     histo = HistogramPlot(dockarea=area, with_threading=False)
