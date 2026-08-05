@@ -45,17 +45,18 @@ class HistogramPlot(CustomApp):
         {'title': 'Histo:', 'name': 'histo', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
-            {'title': 'AutoBin:', 'name': 'autobin', 'type': 'led', 'value': True},
-            {'title': 'Nbin:', 'name': 'nbins', 'type': 'int', 'value': 100, 'readonly': True},
+            {'title': 'AutoBin:', 'name': 'autobin', 'type': 'led', 'value': False},
+            {'title': 'Nbin:', 'name': 'nbins', 'type': 'int', 'value': 100, 'readonly': False},
             ]},
 
     ]
     def __init__(self, dockarea: DockArea | None = None,
-                 title='Histogram',):
+                 title='Histogram',
+                 with_threading=True):
 
         super().__init__(dockarea,
                          title=title,
-                         create_app_toolbar=False,
+                         create_app_toolbar=True,
                          add_toolbar_break=False)
 
         self._h5saver: H5Saver | str | Path = None
@@ -66,9 +67,25 @@ class HistogramPlot(CustomApp):
         self.worker.dte_signal.connect(self.viewer.show_data)
         self.worker.nbins_signal.connect(self.settings.child('histo', 'nbins').setValue)
 
-        # self.runner_thread = QtCore.QThread()
-        # self.worker.moveToThread(self.runner_thread)
-        # self.runner_thread.start()
+        if with_threading:
+            self.runner_thread = QtCore.QThread()
+            self.worker.moveToThread(self.runner_thread)
+            self.runner_thread.start()
+
+        self.setup_ui()
+
+    def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
+        pass
+
+    def setup_docks_and_widgets(self):
+        pass
+
+    def setup_actions(self):
+        self.add_action('show_file', 'Show file content', 'folder_data',
+                        tip='Browse the content of the current HDF5 file')
+
+    def connect_things(self):
+        self.connect_action('show_file', self.show_file_content)
 
     def update_h5_saver(self, h5saver: H5Saver | str | Path,
                         node: str = 'RawData/Ramp000'):
@@ -80,7 +97,7 @@ class HistogramPlot(CustomApp):
             self.settings['h5info', 'h5path'] = str(h5saver)
             self._h5saver = H5Saver()
             self._h5saver.init_file(addhoc_file_path=h5saver)
-        self.update_node()
+        self.update_node(node)
         self.update_actuator()
 
     def update_node(self, node_name: str | Node = None):
@@ -99,8 +116,20 @@ class HistogramPlot(CustomApp):
             node_name = nodes[0]
         with self.settings.child('h5info', 'node_path').treeChangeBlocker():
             self.settings.child('h5info', 'node_path').setOpts(value=node_name, limits=nodes)
+        self.settings['histo', 'nbins'] = self.check_min_axis_size()
         self._settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
 
+    def check_min_axis_size(self) -> int:
+        """ Look at the arrays under current node for the minimal navigation size"""
+        min_size = None
+        with DataLoader(self.h5saver, swmr_mode=True) as dl:
+            for ind, node in enumerate(dl.walk_nodes(self.settings['h5info', 'node_path'])):
+                if 'shape' in node.attrs:
+                    if min_size is None:
+                        min_size = node.attrs['shape'][0]
+                    else:
+                        min_size = min(min_size, node.attrs['shape'][0])
+        return min_size
     def update_actuator(self, actuator: str = None):
         actuators = []
         with DataLoader(self.h5saver, swmr_mode=True) as dl:
@@ -127,7 +156,7 @@ class HistogramPlot(CustomApp):
             ):
             self.compute_plot_histogram(self.settings['h5info', 'actuator'])
         elif param.name() == 'node_path':
-            self.compute_plot_histogram(self.settings['h5info', 'actuator'])
+            self.settings['histo', 'nbins'] = self.check_min_axis_size()
         elif param.name() == 'actuator':
             self.compute_plot_histogram(param.value())
 
@@ -199,19 +228,23 @@ class HistoWorker(QtCore.QObject):
         averaged_actuator_values = np.atleast_1d(
             self.average_data_over_indexes(xdwa[0], indexes))
 
+        nans = np.isnan(averaged_actuator_values)
+
         for dwa in dte:
             indexes = np.digitize(dwa.get_axis_from_index(nav_index)[0].get_data(), bin_edges)
-            arrays = [np.atleast_1d(
+            arrays = [np.delete(
+                np.atleast_1d(
                 self.average_data_over_indexes(dwa[ind],
                                                indexes,
-                                               len(averaged_actuator_values)-1)) for ind in
-                        range(len(dwa))]
+                                               len(averaged_actuator_values)-1)),
+                nans, axis=0) for ind in range(len(dwa))]
             try:
                 dwa_processed = DataCalculated(
                     dwa.name, origin=dwa.origin,
                     data = arrays,
                     axes = [Axis(label=xdwa.name, units=xdwa.units,
-                                 data=averaged_actuator_values,
+                                 data=np.delete(averaged_actuator_values,
+                                                nans, axis=0),
                                  index=nav_index)] +
                            [dwa.get_axis_from_index(ind)[0] for ind in dwa.sig_indexes],
                     labels=dwa.labels,
@@ -256,7 +289,7 @@ if __name__ == '__main__':
     file_path = r'C:\Data\2026\20260804\Dataset_20260804_040.h5'
 
     win, area = make_window(title='Histogram', flags=None)
-    histo = HistogramPlot(dockarea=area)
+    histo = HistogramPlot(dockarea=area, with_threading=False)
     histo.settings.child('h5info', 'node_path').setOpts(readonly=False)
     histo.settings.child('h5info', 'actuator').setOpts(readonly=False)
     histo.update_h5_saver(file_path)
