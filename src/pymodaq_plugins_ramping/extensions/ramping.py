@@ -213,7 +213,7 @@ class RampExtension(CustomExt):
         self.add_action('show_saving', 'Show Saving Options', 'settings',
                         menu=MenuToolbarNames.TOOLS, checkable=True,
                         toolbar=self.toolbar, tip='Display in a Dock the Saving Settings')
-        self.histogramer.set_action_visible('show_saving', False)
+        self.histogramer.set_action_visible('show_file', False)
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
