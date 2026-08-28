@@ -111,6 +111,10 @@ class RampExtension(CustomExt):
         self.ramp_timer = QtCore.QTimer()
         self.ramp_timer.timeout.connect(self.update_ramp)
 
+        self.wait_after_stop_timer = QtCore.QTimer()
+        self.wait_after_stop_timer.setSingleShot(True)
+        self.wait_after_stop_timer.timeout.connect(self.go_home)
+
         self.total_ramp_timer = QtCore.QTimer()
         self.total_ramp_timer.timeout.connect(self.stop_ramp)
 
@@ -246,6 +250,7 @@ class RampExtension(CustomExt):
         self.histogramer.compute_plot_histogram(self.settings['actuator'])
 
     def start_ramp(self):
+        self.wait_after_stop_timer.stop()
         try:
             self.actuator.move_done_signal.disconnect(self.start_ramp)
         except TypeError:
@@ -353,11 +358,8 @@ class RampExtension(CustomExt):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
         #self.histogramer_timer.stop()
-        self.wait_timer = QtCore.QTimer()
-        self.wait_timer.setInterval(3600000)
-        self.wait_timer.setSingleShot(True)
-        self.wait_timer.timeout.connect(self.go_home)
-        self.wait_timer.start()
+        self.wait_after_stop_timer.setInterval(3600000)
+        self.wait_after_stop_timer.start()
         for detector in self.detectors:
             try:
                 detector.grab_done_signal.disconnect(self.send_data)
