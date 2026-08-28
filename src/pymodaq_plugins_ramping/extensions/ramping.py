@@ -2,7 +2,7 @@
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable, TYPE_CHECKING, Union, Mapping
-
+import numpy as np
 from qtpy import QtWidgets, QtCore
 
 from pymodaq_data import Q_, DataDim, DataSource
@@ -78,9 +78,10 @@ class RampExtension(CustomExt):
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
-            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 40, 'suffix': 's', 'siPrefix': True},
-            {'title': 'Velocity:', 'name': 'velocity', 'type': 'float', 'value': 0, 'suffix': '', 'siPrefix': True,
-             'readonly': True},
+            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 40, 'suffix': 'min', 'siPrefix': True,
+            'readonly' : True},
+            {'title': 'Velocity:', 'name': 'velocity', 'type': 'float', 'value': 0, 'siPrefix': True,
+             'readonly': False},
         ]},
         {'title': 'Use Steps:', 'name': 'use_steps', 'type': 'bool', 'value': True},
         {'title': 'Steps:', 'name': 'steps', 'type': 'group', 'children': [
@@ -101,14 +102,18 @@ class RampExtension(CustomExt):
 
         super().__init__(parent, dashboard, add_toolbar_break=False)
 
-        self._start_time: float = None
-        self._paused_time: float = None
+        self._start_time: Q_ = None
+        self._paused_time: Q_ = None
         self.ramp: RampGenerator = None
 
         self._n_emitted = 0
 
         self.ramp_timer = QtCore.QTimer()
         self.ramp_timer.timeout.connect(self.update_ramp)
+
+        self.wait_after_stop_timer = QtCore.QTimer()
+        self.wait_after_stop_timer.setSingleShot(True)
+        self.wait_after_stop_timer.timeout.connect(self.go_home)
 
         self.total_ramp_timer = QtCore.QTimer()
         self.total_ramp_timer.timeout.connect(self.stop_ramp)
@@ -123,7 +128,7 @@ class RampExtension(CustomExt):
         self.setup_ui()
 
         self.update_n_steps()
-        self.update_velocity()
+        self.update_duration()
 
         self.enable_runflow_actions(False)
 
@@ -245,6 +250,7 @@ class RampExtension(CustomExt):
         self.histogramer.compute_plot_histogram(self.settings['actuator'])
 
     def start_ramp(self):
+        self.wait_after_stop_timer.stop()
         try:
             self.actuator.move_done_signal.disconnect(self.start_ramp)
         except TypeError:
@@ -256,9 +262,13 @@ class RampExtension(CustomExt):
             pass
 
         if self.settings['use_steps']:
-            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step']))
+            self.ramp_timer.setInterval(
+                int(Q_(self.settings['steps', 'time_step'],
+                       self.settings.child('steps', 'time_step').opts['suffix']).to('ms').magnitude))
 
-        self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
+        self.total_ramp_timer.setInterval(
+            int(Q_(self.settings['ramp', 'duration'],
+                   self.settings.child('ramp', 'duration').opts['suffix']).to('ms').magnitude))
         self.total_ramp_timer.setSingleShot(True)
 
         if self.is_action_checked('save'):
@@ -348,7 +358,8 @@ class RampExtension(CustomExt):
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
         #self.histogramer_timer.stop()
-
+        self.wait_after_stop_timer.setInterval(3600000)
+        self.wait_after_stop_timer.start()
         for detector in self.detectors:
             try:
                 detector.grab_done_signal.disconnect(self.send_data)
@@ -376,6 +387,9 @@ class RampExtension(CustomExt):
         else:
             self._worker_done.connect(self.terminate_worker)
 
+    def go_home(self):
+        self.actuator.move_home()
+
     def terminate_worker(self):
         self.exit_runner_thread()
         self.h5saver.flush()
@@ -389,14 +403,14 @@ class RampExtension(CustomExt):
         if do_pause:
             self.ramp_timer.stop()
             #self.histogramer_timer.stop()
-            self._paused_time = perf_counter()
+            self._paused_time = Q_(perf_counter(), 's')
             for detector in self.detectors:
                 detector.grab_done_signal.disconnect(self.send_data)
             for actuator in self.actuators:
                 actuator.current_value_signal.disconnect(self.send_data)
             self.actuator.current_value_signal.disconnect(self.send_data)
         else:
-            self._start_time = perf_counter() - (self._paused_time - self._start_time)
+            self._start_time = Q_(perf_counter(),'s') - (self._paused_time - self._start_time)
 
             for detector in self.detectors:
                 detector.grab_done_signal.connect(self.send_data)
@@ -410,8 +424,8 @@ class RampExtension(CustomExt):
 
     def update_ramp(self):
         if self._start_time is None:
-            self._start_time = perf_counter()
-        elapsed_time = perf_counter() - self._start_time
+            self._start_time = Q_(perf_counter(), 's')
+        elapsed_time = Q_(perf_counter(), 's') - self._start_time
 
         step = self.ramp(elapsed_time)
         self.settings['steps', 'step'] = step
@@ -465,23 +479,31 @@ class RampExtension(CustomExt):
             self.update_ramp_settings()
         elif param.name() == 'use_steps':
             self.settings.child('steps').show(param.value())
-        if param.name() in ('duration', 'start', 'stop'):
-            self.update_velocity()
+        if param.name() in ('velocity', 'start', 'stop'):
+            self.update_duration()
 
     def update_n_steps(self):
-        self.settings['steps', 'nsteps'] = (Q_(self.settings['ramp', 'duration'], 's') /
-                                            Q_(self.settings['steps', 'time_step'], 'ms').to('s')).magnitude
+        self.settings['steps', 'nsteps'] = (Q_(self.settings['ramp', 'duration'],
+                                               self.settings.child('ramp', 'duration').opts['suffix']) /
+                                            Q_(self.settings['steps', 'time_step'],
+                                               self.settings.child('steps', 'time_step').opts['suffix'])).to_reduced_units().magnitude
 
-    def update_velocity(self):
+    def update_duration(self):
         if self.actuator is not None:
-            self.settings['ramp', 'velocity'] = (
-                    (self.settings['ramp', 'stop'] - self.settings['ramp', 'start']) / self.settings['ramp', 'duration'])
-            self.settings.child('ramp', 'velocity').setOpts(suffix=f'{self.actuator.units}/s')
+            if not np.allclose(self.settings['ramp','velocity'], 0):
+                self.settings.child('ramp', 'velocity').setOpts(suffix=f'{self.actuator.units}/min')
+                self.settings['ramp', 'duration'] = (
+                        (self.settings['ramp', 'stop'] - self.settings['ramp', 'start']) / self.settings['ramp', 'velocity'])
+                self.settings.child('ramp', 'duration').setOpts(suffix='min')
+            else :
+                self.settings['ramp', 'duration'] = 0
+
 
     def get_ramp(self) -> RampGenerator:
         return RampGenerator(self.settings['ramp', 'start'],
                              self.settings['ramp', 'stop'],
-                             self.settings['ramp', 'duration'],)
+                             Q_(self.settings['ramp', 'duration'],
+                                self.settings.child('ramp', 'duration').opts['suffix']))
 
     def send_data(self, dte: DataToExport | DataActuator):
         if self.is_action_checked('save'):
