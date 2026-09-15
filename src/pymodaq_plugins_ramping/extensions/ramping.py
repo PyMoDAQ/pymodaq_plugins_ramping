@@ -5,6 +5,9 @@ from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
 from qtpy import QtWidgets, QtCore
 
+from pymodaq.control_modules.enums import MoveType
+from pymodaq.extensions.extension_worker import ExtensionWorker
+from pymodaq.utils.h5modules.module_saving import DataBundle
 from pymodaq_data import Q_, DataDim, DataSource
 
 from pymodaq.control_modules.thread_commands import ControlToHardwareMove
@@ -13,11 +16,14 @@ from pymodaq.utils.managers.modules import ModuleType
 from pymodaq_data import DataToExport, DataWithAxes
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
-from pymodaq_gui.utils import DockArea, Dock
+from pymodaq_gui.messenger import messagebox
+from pymodaq_gui.utils import DockArea, Dock, QSpinBox_ro
+from pymodaq_gui.utils.custom_app import WorkFlowActions
 
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
 from pymodaq_plugins_ramping.utilities.histograming import HistogramPlot
 from pymodaq_plugins_ramping.utilities.module_saver import RampSaver, GROUP
+from pymodaq_scripting import Actuator
 from pymodaq_utils.config import GlobalConfig
 from pymodaq_utils.logger import set_logger, get_module_name
 
@@ -25,6 +31,7 @@ from pymodaq.extensions.utils import CustomExt
 
 from pymodaq_plugins_ramping.utilities.ramp_generator import RampGenerator
 from pymodaq_utils.utils import ThreadCommand
+from pymodaq_gui.utils.widgets import QLED
 
 if TYPE_CHECKING:
     from pymodaq.control_modules.daq_move import DAQ_Move
@@ -40,33 +47,62 @@ EXTENSION_NAME = 'Ramp'  # the name that will be displayed in the extension list
 CLASS_NAME = 'RampExtension'  # this should be the name of your class defined below
 
 
-class SaverWorker(QtCore.QObject):
-    """ Worker in separated thread receiving the data from the control modules
-    and adding them into the enlargeable arrays with the H5file. All this through the
-    RampSaver ModuleSaver """
-    n_saved = QtCore.Signal(int)
+class StatusBarManager:
+    def __init__(self, app: 'RampExtension'):
+        self.app = app
 
-    def __init__(self, module: RampSaver):
-        super().__init__()
-        self.module: RampSaver = module
-        self._n_saved = 0
+        self._running_led: QLED = None
+        self._index_sb: QSpinBox_ro = None
+        self._n_steps_sb: QSpinBox_ro = None
 
-    @QtCore.Slot(DataToExport)
-    def save_data(self, dte: DataToExport):
+    @property
+    def statusbar(self):
+        return self.app.statusbar
 
-        self.module.add_data(dte)
-        self._n_saved += 1
-        self.n_saved.emit(self._n_saved)
+    def set_permanent_status(self, status: str):
+        self.app.set_permanent_status(status)
+
+    def create_permanent_widgets(self):
+        self._n_steps_sb = QSpinBox_ro()
+        self._n_steps_sb.setToolTip('Total number of steps')
+
+        self._index_sb = QSpinBox_ro()
+        self._index_sb.setToolTip('Total number of steps')
+
+        self._running_led = QLED()
+        self._running_led.setToolTip('Ramping status: green (running), red (idle)')
+        self._running_led.clickable = False
+        self.statusbar.addPermanentWidget(self._running_led)
+        pass
+
+    @property
+    def is_ramping(self) -> bool:
+        return self._running_led.get_state()
+
+    @is_ramping.setter
+    def is_ramping(self, is_ramping: bool):
+        self._running_led.set_as(is_ramping)
+
+    @property
+    def n_steps(self):
+        return self._n_steps_sb.value()
+
+    @n_steps.setter
+    def n_steps(self, nsteps: int):
+        self._n_steps_sb.setValue(nsteps)
+
+    def set_current_step(self, step_ind: int):
+        self._index_sb.setValue(step_ind)
 
 
 
 
 class RampExtension(CustomExt):
-    send_data_signal = QtCore.Signal(DataToExport)
-    _worker_done = QtCore.Signal()
 
     _h5_base_group_name = 'Ramp'
-    _show_h5file_widgets = True
+    _show_h5file_statusbar_widgets = True
+    show_workflow_actions = True
+
     params = [
         {'title': 'Ramping Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors to save:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
@@ -89,29 +125,20 @@ class RampExtension(CustomExt):
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
         ]},
-        {'title': 'Worker:', 'name': 'worker', 'type': 'group', 'children': [
-            {'title': 'Worker Running:', 'name': 'worker_running', 'type': 'led', 'value': False, 'readonly': True},
-            {'title': 'Worker tasks:', 'name': 'worker_tasks', 'type': 'int', 'value': 0, 'readonly': True},
-        ]},
-    ]
+    ] + ExtensionWorker.params
 
 
     def __init__(self, parent: gutils.DockArea, dashboard):
         self.histogramer = HistogramPlot(dockarea=parent)
+        self.ramping_worker = RampingWorker(self)
 
         super().__init__(parent, dashboard, add_toolbar_break=False)
 
-        self._start_time: float = None
-        self._paused_time: float = None
+
         self.ramp: RampGenerator = None
 
-        self._n_emitted = 0
+        self.status_manager = StatusBarManager(self)
 
-        self.ramp_timer = QtCore.QTimer()
-        self.ramp_timer.timeout.connect(self.update_ramp)
-
-        self.total_ramp_timer = QtCore.QTimer()
-        self.total_ramp_timer.timeout.connect(self.stop_ramp)
 
         self.histogramer_timer = QtCore.QTimer()
         self.histogramer_timer.timeout.connect(self.update_histogramer)
@@ -119,18 +146,14 @@ class RampExtension(CustomExt):
         self._actuator: 'DAQ_Move' = None
 
         self._module_and_data_saver = RampSaver(self)
-        self.current_node: GROUP | str = None
+
         self.setup_ui()
 
         self.update_n_steps()
         self.update_velocity()
 
-        self.enable_runflow_actions(False)
+        self.enable_workflow_actions(False)
 
-    def setup_saving(self):
-        node_name = self.module_and_data_saver.get_set_node(new=True)
-        self.h5saver.settings.child('current_scan_name').setValue(node_name)
-        self.update_file_status_led()
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -149,12 +172,17 @@ class RampExtension(CustomExt):
         self.saving_dock.setVisible(False)
         self.populate_status_bar()
 
+    def populate_status_bar(self):
+        super().populate_status_bar()
+        self.status_manager.create_permanent_widgets()
+        self.status_manager.set_permanent_status('')
+
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
         self.settings.child('actuator').setLimits(self.modules_manager.actuators_name)
         self.display_control_modules()
 
-        self.enable_runflow_actions(True)
+        self.enable_workflow_actions(True, other_actions='ini_positions')
         self._module_and_data_saver = RampSaver(self)
 
     def display_control_modules(self):
@@ -171,10 +199,10 @@ class RampExtension(CustomExt):
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
         """Non mandatory method to be subclassed in order to create a menubar
         """
+        self.add_toolbar(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(), self.mainwindow,
+                         toolbar=self.h5_manager.toolbar, add_break=False)
         self.add_menu(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(), parent_menu=menubar)
         self.add_menu(MenuToolbarNames.TOOLS, MenuToolbarNames.TOOLS.capitalize(), parent_menu=menubar)
-        self.add_menu('actions', 'Actions', parent_menu=menubar)
-
 
     def do_things_after_ui_setup(self):
         self.create_dashboard_toolbar(add_break=False)
@@ -189,240 +217,18 @@ class RampExtension(CustomExt):
         self.add_action('ini_positions', 'Init Positions', 'arrows_input',
                         menu='actions',
                         toolbar=self.toolbar, tip='Go to Initial Ramp position')
-        self.add_action('start', 'Start', 'motion_play', "Start the Ramping",
-                        menu='actions',
-                        icon_color=self.get_theme().green, toolbar=self.toolbar)
-        self.add_action('stop', 'Stop Scan', 'stop_circle', "Stop the Ramping",
-                        menu='actions',
-                        icon_color=self.get_theme().red, toolbar=self.toolbar)
-        self.add_action('pause', 'Pause Scan', 'pause_circle',
-                        menu='actions', tip="Pause/resume the Ramping",
-                        checkable=True, toolbar=self.toolbar,
-                        icon_checked_color=self.get_theme().orange)
-        self._toolbar.addSeparator()
-        self.add_action('show_file', 'Show file content', 'folder_data',
-                        tip='Browse the content of the current HDF5 file')
-
-        self.add_action('new_file', 'New file', 'add_circle', menu=MenuToolbarNames.FILE, auto_toolbar=False)
-        self.add_action('load', 'Open file to append...', 'file_open', menu=MenuToolbarNames.FILE, auto_toolbar=False)
-        self.get_menu(MenuToolbarNames.FILE).addSeparator()
-        self.add_action('save', 'Save', 'save', toolbar=self.toolbar, checkable=True,
-                        tip='Save data', checked=True, icon_checked_color=self.get_theme().green,
-                        icon_color=self.get_theme().red)
-
-        self.add_action('show_saving', 'Show Saving Options', 'settings',
-                        menu=MenuToolbarNames.TOOLS, checkable=True,
-                        toolbar=self.toolbar, tip='Display in a Dock the Saving Settings')
-        self.histogramer.set_action_visible('show_file', False)
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
-        self.connect_action('start', self.go_to_ini_and_start)
-        self.connect_action('stop', self.stop_ramp)
-        self.connect_action('pause', self.pause_ramp)
+        self.connect_action(WorkFlowActions.START, self.ramping_worker.start)
+        self.connect_action(WorkFlowActions.STOP, self.ramping_worker.stop)
+        self.connect_action(WorkFlowActions.PAUSE, self.ramping_worker.pause)
 
-        self.connect_action('ini_positions', self.go_to_ini_ramp)
+        self.connect_action('ini_positions', self.ramping_worker.go_to_ini_ramp)
 
-        self.connect_action('new_file', self.create_new_file)
-        self.connect_action('load', lambda: self.load_file())
-
-        self.connect_action('show_file', self.show_file_content)
-
-        self.connect_action('show_saving', self.saving_dock.setVisible)
-
-    def go_to_ini_ramp(self):
-        actuator_value = DataActuator('ramp',
-                                      data=self.settings['ramp', 'start'],
-                                      units=self.actuator.units, )
-        self.actuator.command_hardware.emit(
-            ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, True]))
-
-    def go_to_ini_and_start(self):
-        self.actuator.move_done_signal.connect(self.start_ramp)
-        self.go_to_ini_ramp()
 
     def update_histogramer(self):
         self.histogramer.compute_plot_histogram(self.settings['actuator'])
-
-    def start_ramp(self):
-        try:
-            self.actuator.move_done_signal.disconnect(self.start_ramp)
-        except TypeError:
-            pass
-
-        try:
-            self._worker_done.disconnect(self.terminate_worker)
-        except TypeError:
-            pass
-
-        if self.settings['use_steps']:
-            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step']))
-
-        self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
-        self.total_ramp_timer.setSingleShot(True)
-
-        if self.is_action_checked('save'):
-            self.setup_saving()
-            self.current_node = self.module_and_data_saver.get_last_node('/RawData')
-            self.histogramer.update_h5_saver(self.h5saver.file_path,
-                                             node=self.current_node,
-                                             actuator=self.settings['actuator'],
-                                             )
-            self.histogramer_timer.setInterval(int(self.settings['refresh_plot']))
-
-        self._n_emitted = 0
-
-        for detector in self.detectors:
-            detector.settings['main_settings', 'wait_time'] = self.settings['refresh_grab']
-        for actuator in self.actuators:
-            actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
-        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
-
-        if self.runner_thread is not None and self.runner_thread.isRunning():
-            self.exit_runner_thread()
-
-        if self.is_action_checked('save'):
-            self.runner_thread = QtCore.QThread()
-            self.worker = SaverWorker(module=self.module_and_data_saver)
-            self.worker.n_saved.connect(self.update_worker_ntask)
-            self.send_data_signal.connect(self.worker.save_data)
-            self.worker.moveToThread(self.runner_thread)
-
-        self.ramp = self.get_ramp()
-
-        self.runner_thread.start()
-        self.settings['worker', 'worker_running'] = True
-
-        # connect data signals to the event loop of the worker thread
-        for detector in self.detectors:
-            detector.grab_done_signal.connect(self.send_data)
-            detector.grab_data(True)
-        for actuator in self.actuators:
-            actuator.current_value_signal.connect(self.send_data)
-            actuator.get_continuous_actuator_value(get_value=True)
-        self.actuator.current_value_signal.connect(self.send_data)
-        self.actuator.get_continuous_actuator_value(get_value=True)
-
-        if self.settings['use_steps']:
-            self.ramp_timer.start()
-            self.update_ramp()
-        else:
-            actuator_value = DataActuator('ramp',
-                                          data=self.settings['ramp', 'stop'],
-                                          units=self.actuator.units, )
-            self.actuator.command_hardware.emit(
-                ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
-
-            self.total_ramp_timer.start()
-        if self.is_action_checked('save'):
-            pass
-            #self.histogramer_timer.start()
-        self.enable_runflow_actions(False, excepted=('pause', 'stop'))
-
-    def enable_runflow_actions(self, enable=True, excepted: Iterable[str] = ()):
-        for action in ('start', 'ini_positions', 'pause', 'stop', 'save'):
-            if action not in excepted:
-                self.set_action_enabled(action, enable)
-
-    @property
-    def detectors(self) -> list['DAQ_Viewer']:
-        detectors = []
-        for detector in self.settings['detectors']['selected']:
-            det = self.modules_manager.get_mod_from_name(detector,
-                                                         mod=ModuleType.Detector)
-            if det is not None:
-                detectors.append(det)
-        return detectors
-
-    @property
-    def actuators(self) -> Iterable['DAQ_Move']:
-        actuators = []
-        for actuator in self.settings['actuators']['selected']:
-            act = self.modules_manager.get_mod_from_name(actuator,
-                                                         mod=ModuleType.Actuator)
-            if act is not None:
-                actuators.append(act)
-        return actuators
-
-    def stop_ramp(self):
-        self.ramp_timer.stop()
-        self.total_ramp_timer.stop()
-        #self.histogramer_timer.stop()
-
-        for detector in self.detectors:
-            try:
-                detector.grab_done_signal.disconnect(self.send_data)
-            except TypeError:
-                pass
-            detector.grab_data(False)
-
-        for actuator in self.actuators:
-            try:
-                actuator.current_value_signal.disconnect(self.send_data)
-
-            except TypeError:
-                pass
-            actuator.get_continuous_actuator_value(get_value=False)
-        try:
-            self.actuator.current_value_signal.disconnect(self.send_data)
-        except TypeError:
-            pass
-        self.actuator.get_continuous_actuator_value(get_value=False)
-
-        self._start_time = None
-
-        if self.settings['worker', 'worker_tasks'] == 0:
-            self.terminate_worker()
-        else:
-            self._worker_done.connect(self.terminate_worker)
-
-    def terminate_worker(self):
-        self.exit_runner_thread()
-        self.h5saver.flush()
-        self.h5saver.close_file()
-        self.update_file_status_led()
-        self.enable_runflow_actions(True)
-        self.settings['worker', 'worker_running'] = False
-        self.update_histogramer()
-
-    def pause_ramp(self, do_pause=True):
-        if do_pause:
-            self.ramp_timer.stop()
-            #self.histogramer_timer.stop()
-            self._paused_time = perf_counter()
-            for detector in self.detectors:
-                detector.grab_done_signal.disconnect(self.send_data)
-            for actuator in self.actuators:
-                actuator.current_value_signal.disconnect(self.send_data)
-            self.actuator.current_value_signal.disconnect(self.send_data)
-        else:
-            self._start_time = perf_counter() - (self._paused_time - self._start_time)
-
-            for detector in self.detectors:
-                detector.grab_done_signal.connect(self.send_data)
-            for actuator in self.actuators:
-                actuator.current_value_signal.connect(self.send_data)
-            self.actuator.current_value_signal.connect(self.send_data)
-            self.ramp_timer.start()
-            if self.is_action_checked('save'):
-                #self.histogramer_timer.start()
-                pass
-
-    def update_ramp(self):
-        if self._start_time is None:
-            self._start_time = perf_counter()
-        elapsed_time = perf_counter() - self._start_time
-
-        step = self.ramp(elapsed_time)
-        self.settings['steps', 'step'] = step
-        actuator_value = DataActuator('ramp',
-                                     data=step,
-                                     units=self.actuator.units,)
-        self.actuator.command_hardware.emit(
-            ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
-
-        if elapsed_time > self.settings['ramp', 'duration']:
-            self.stop_ramp()
 
     @property
     def actuators_name(self) -> Iterable[str]:
@@ -483,43 +289,19 @@ class RampExtension(CustomExt):
                              self.settings['ramp', 'stop'],
                              self.settings['ramp', 'duration'],)
 
-    def send_data(self, dte: DataToExport | DataActuator):
-        if self.is_action_checked('save'):
-            if isinstance(dte, DataActuator):
-                dte = DataToExport(dte.name, data=[dte])
+    def _quit_fun(self):
+        if self.ramping_worker.is_running:
+            messagebox(title='Running',
+                       text='The Ramping is running, first stop it')
+            return False
 
-            # filtering dwa to be saved
-            dte_filtered = DataToExport(dte.name)
-            for dwa in dte:
-                if 'do_save' in dwa.extra_attributes and dwa.do_save:
-                    dte_filtered.append(dwa)
-                elif self.filter_data_wrt_settings(dwa):
-                    dte_filtered.append(dwa)
+        elif self.settings['worker', 'worker_tasks'] > 0:
+            messagebox(title='Running',
+                       text='The Saver is finishing the savings')
+            self.ramping_worker.stop("User prompted a quit of the Application, Stopping the Acquisition")
+            return False
 
-            self.send_data_signal.emit(dte_filtered)
-            self._n_emitted += 1
-
-    def filter_data_wrt_settings(self, dwa: DataWithAxes):
-        flag = True
-        if not self.h5saver.settings['save_2D']:  # exclude 2D data and above
-            flag = flag and not (dwa.dim == DataDim.Data2D or dwa.dim == DataDim.DataND)
-        if self.h5saver.settings['save_raw_only']:  # exclude Calculated data
-            flag = flag and dwa.source == DataSource.raw
-        return flag
-
-    @QtCore.Slot(int)
-    def update_worker_ntask(self, n_saved: int):
-        n_tasks = self._n_emitted - n_saved
-        self.settings['worker', 'worker_tasks'] = n_tasks
-
-        if n_tasks == 0:
-            self._worker_done.emit()
-
-    def quit_fun(self):
-        self.h5saver.flush()
-        self.h5saver.close()
-        self.histogramer.quit_fun()
-        super().quit_fun()
+        return True
 
     def get_app_toolbars(self) -> list[QtWidgets.QToolBar]:
         """ Get the main toolbars widget to be eventually added in the main window toolbararea
@@ -527,6 +309,231 @@ class RampExtension(CustomExt):
         Default is the default toolbar. To be reimplemented if needed
         """
         return [self.toolbar, self.histogramer.toolbar]
+
+
+class RampingWorker(ExtensionWorker):
+
+    def __init__(self, ramper: RampExtension, parent=None):
+        super().__init__(app=ramper, parent=parent)
+
+        self.ramp_timer = QtCore.QTimer()
+        self.ramp_timer.timeout.connect(self.update_ramp)
+
+        self.total_ramp_timer = QtCore.QTimer()
+        self.total_ramp_timer.timeout.connect(self.stop)
+
+        self._start_time: float = None
+        self._paused_time: float = None
+
+        self.current_node: GROUP | str = None
+
+    @property
+    def ramp(self) -> RampGenerator:
+        return self.app.get_ramp()
+
+    @property
+    def app(self) -> RampExtension:
+        return self._app
+
+    @property
+    def status_manager(self) -> StatusBarManager:
+        return self.app.status_manager
+
+    @property
+    def actuator(self) -> 'DAQ_Move':
+        return self.app.actuator
+
+    @property
+    def detectors(self) -> list['DAQ_Viewer']:
+        detectors = []
+        for detector in self.settings['detectors']['selected']:
+            det = self.modules_manager.get_mod_from_name(detector,
+                                                         mod=ModuleType.Detector)
+            if det is not None:
+                detectors.append(det)
+        return detectors
+
+    @property
+    def actuators(self) -> Iterable['DAQ_Move']:
+        actuators = []
+        for actuator in self.settings['actuators']['selected']:
+            act = self.modules_manager.get_mod_from_name(actuator,
+                                                         mod=ModuleType.Actuator)
+            if act is not None:
+                actuators.append(act)
+        return actuators
+
+    def go_to_ini_ramp(self):
+        actuator_value = DataActuator('ramp',
+                                      data=self.settings['ramp', 'start'],
+                                      units=self.actuator.units, )
+        self.actuator.command_hardware.emit(
+            ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, True]))
+
+
+    def _start(self):
+
+        self.modules_manager.move_actuators_with_callback(
+            DataToExport(self.actuator.title, data=[DataActuator(self.actuator.title,
+                                                                 data=self.settings['ramp', 'start'],
+                                                                 units=self.actuator.units, )]),
+            mode=MoveType.ABS,
+            callback=self._on_ini_ramp_done
+        )
+
+
+    def _on_ini_ramp_done(self, dte: DataToExport):
+        self.modules_manager.forget_callback(self._on_ini_ramp_done,
+                                             module_type=ModuleType.Actuator,
+                                             disconnect_modules=True)
+
+        self.ini_things()
+        self.connect_modules()
+        self.run_ramp()
+
+    def ini_things(self):
+
+        if self.settings['use_steps']:
+            self.ramp_timer.setInterval(int(self.settings['steps', 'time_step']))
+
+        self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
+        self.total_ramp_timer.setSingleShot(True)
+
+        if self.app.is_action_checked(WorkFlowActions.LOG):
+            self.module_and_data_saver.h5saver = self.h5_manager.h5saver
+            self.current_node = self.module_and_data_saver.get_set_node(new=True)
+
+            # self.histogramer.update_h5_saver(self.h5saver.file_path,
+            #                                  node=self.current_node,
+            #                                  actuator=self.settings['actuator'],
+            #                                  )
+            # self.histogramer_timer.setInterval(int(self.settings['refresh_plot']))
+
+        self._n_emitted = 0
+
+        for detector in self.detectors:
+            detector.settings['main_settings', 'wait_time'] = self.settings['refresh_grab']
+        for actuator in self.actuators:
+            actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
+        self.actuator.settings['main_settings', 'refresh_timeout'] = self.settings['refresh_grab']
+
+    def connect_modules(self):
+        # connect data signals to the event loop of the worker thread
+        for detector in self.detectors:
+            detector.grab_done_signal.connect(self.send_data)
+        for actuator in self.actuators:
+            actuator.current_value_signal.connect(self.send_data)
+        self.actuator.current_value_signal.connect(self.send_data)
+
+
+    def start_modules(self):
+        for detector in self.detectors:
+            detector.grab_data(True)
+        for actuator in self.actuators:
+            actuator.get_continuous_actuator_value(get_value=True)
+        self.actuator.get_continuous_actuator_value(get_value=True)
+
+    def disconnect_modules(self):
+        for detector in self.detectors:
+            try:
+                detector.grab_done_signal.disconnect(self.send_data)
+            except TypeError:
+                pass
+
+        for actuator in self.actuators:
+            try:
+                actuator.current_value_signal.disconnect(self.send_data)
+
+            except TypeError:
+                pass
+        try:
+            self.actuator.current_value_signal.disconnect(self.send_data)
+        except TypeError:
+            pass
+
+    def stop_modules(self):
+        for detector in self.detectors:
+            detector.grab_data(False)
+
+        for actuator in self.actuators:
+            actuator.get_continuous_actuator_value(get_value=False)
+
+        self.actuator.get_continuous_actuator_value(get_value=False)
+
+    def run_ramp(self):
+        self._start_time = perf_counter()
+        self.start_modules()
+
+        if self.settings['use_steps']:
+            self.ramp_timer.start()
+            self.update_ramp()
+        else:
+            actuator_value = DataActuator('ramp',
+                                          data=self.settings['ramp', 'stop'],
+                                          units=self.actuator.units, )
+            self.actuator.command_hardware.emit(
+                ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
+
+            self.total_ramp_timer.start()
+        if self.app.is_action_checked(WorkFlowActions.LOG):
+            pass
+            #self.histogramer_timer.start()
+        self.app.enable_workflow_actions(False, excepted=(WorkFlowActions.PAUSE,
+                                                          WorkFlowActions.STOP,
+                                                          WorkFlowActions.LOG))
+
+    def send_data(self, dte: DataToExport | DataActuator):
+        if self.app.is_action_checked(WorkFlowActions.LOG):
+            if isinstance(dte, DataActuator):
+                dte = DataToExport(dte.origin, data=[dte])
+
+            self.saver_worker.data_to_save_signal.emit(DataBundle(dte=dte))
+            self._n_emitted += 1
+
+    def _stop(self, msg: str = None):
+        self.ramp_timer.stop()
+        self.total_ramp_timer.stop()
+        #self.histogramer_timer.stop()
+
+        self.disconnect_modules()
+        self.stop_modules()
+
+        self._start_time = None
+
+        #self.app.update_histogramer()
+
+    def _pause(self, do_pause=True):
+        if do_pause:
+            self.ramp_timer.stop()
+            #self.histogramer_timer.stop()
+            self._paused_time = perf_counter()
+            self.disconnect_modules()
+        else:
+            self._start_time = perf_counter() - (self._paused_time - self._start_time)
+
+            self.connect_modules()
+            self.ramp_timer.start()
+            if self.app.is_action_checked(WorkFlowActions.LOG):
+                #self.histogramer_timer.start()
+                pass
+
+    def update_ramp(self):
+        if self._start_time is None:
+            self._start_time = perf_counter()
+        elapsed_time = perf_counter() - self._start_time
+
+        step = self.ramp(elapsed_time)
+        self.settings['steps', 'step'] = step
+        actuator_value = DataActuator('ramp',
+                                     data=step,
+                                     units=self.actuator.units,)
+        self.actuator.command_hardware.emit(
+            ThreadCommand(ControlToHardwareMove.MOVE_ABS, [actuator_value, False]))
+
+        if elapsed_time > self.settings['ramp', 'duration']:
+            self.stop()
+
+
 
 
 def main():

@@ -83,31 +83,20 @@ class HistogramPlot(CustomApp):
         self.viewer.show_data(dte)
         self.set_action_enabled('save', True)
 
-    def save_computed_data(self):
-        Path(self.h5saver.settings['base_path']).mkdir(exist_ok=True)
-        filename = select_file(self.h5saver.settings['base_path'], save=True, ext='h5')
-        if filename is not None and filename != '':
-            with DataToExportSaver(filename, new_file=True) as saver:
-                saver.add_data('/RawData', self._current_dte,
-                               settings_as_xml=parameter_to_xml_string(self.settings))
-
     def setup_menus_and_toolbars(self, menubar: QtWidgets.QMenuBar = None):
-        self.add_menu(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(),
-                      parent_menu=menubar)
+        self.add_toolbar(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(), self.mainwindow,
+                         )
+        self.add_menu(MenuToolbarNames.FILE, MenuToolbarNames.FILE.capitalize(), parent_menu=menubar)
+        self.add_menu(MenuToolbarNames.TOOLS, MenuToolbarNames.TOOLS.capitalize(), parent_menu=menubar)
 
     def setup_docks_and_widgets(self):
         pass
 
     def setup_actions(self):
-        self.add_action('show_file', 'Show file content', 'folder_data',
-                        tip='Browse the content of the current HDF5 file')
-
-        self.add_action('save', 'Save Computed Data', 'save',
-                        menu=MenuToolbarNames.FILE, enabled=False)
+        pass
 
     def connect_things(self):
-        self.connect_action('show_file', self.show_file_content)
-        self.connect_action('save', self.save_computed_data)
+        pass
 
     def update_h5_saver(self, h5saver: H5Saver | str | Path,
                         node: str = 'RawData/Ramp000',
