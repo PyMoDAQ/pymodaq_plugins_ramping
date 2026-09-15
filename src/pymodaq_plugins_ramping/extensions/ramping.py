@@ -5,6 +5,7 @@ from typing import Iterable, TYPE_CHECKING, Union, Mapping
 
 from qtpy import QtWidgets, QtCore
 
+from packages.pymodaq.tests.utils.scanner_test.scan_factory_test import actuators
 from pymodaq.control_modules.enums import MoveType
 from pymodaq.extensions.extension_worker import ExtensionWorker
 from pymodaq.utils.h5modules.module_saving import DataBundle
@@ -17,11 +18,13 @@ from pymodaq_data import DataToExport, DataWithAxes
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
 from pymodaq_gui.messenger import messagebox
+from pymodaq_gui.parameter.utils import iter_children, get_param_path
+from pymodaq_gui.plotting.data_viewers import ViewerDispatcher
 from pymodaq_gui.utils import DockArea, Dock, QSpinBox_ro
 from pymodaq_gui.utils.custom_app import WorkFlowActions
 
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
-from pymodaq_plugins_ramping.utilities.histograming import HistogramPlot
+from pymodaq_plugins_ramping.utilities.histograming import HistogramProcessor, H5FileBrowsing
 from pymodaq_plugins_ramping.utilities.module_saver import RampSaver, GROUP
 from pymodaq_scripting import Actuator
 from pymodaq_utils.config import GlobalConfig
@@ -52,7 +55,7 @@ class StatusBarManager:
         self.app = app
 
         self._running_led: QLED = None
-        self._index_sb: QSpinBox_ro = None
+        self._step_sb: QSpinBox_ro = None
         self._n_steps_sb: QSpinBox_ro = None
 
     @property
@@ -66,12 +69,14 @@ class StatusBarManager:
         self._n_steps_sb = QSpinBox_ro()
         self._n_steps_sb.setToolTip('Total number of steps')
 
-        self._index_sb = QSpinBox_ro()
-        self._index_sb.setToolTip('Total number of steps')
+        self._step_sb = QSpinBox_ro()
+        self._step_sb.setToolTip('Current actuator value')
 
         self._running_led = QLED()
         self._running_led.setToolTip('Ramping status: green (running), red (idle)')
         self._running_led.clickable = False
+        self.statusbar.addPermanentWidget(self._step_sb)
+        self.statusbar.addPermanentWidget(self._n_steps_sb)
         self.statusbar.addPermanentWidget(self._running_led)
         pass
 
@@ -91,19 +96,17 @@ class StatusBarManager:
     def n_steps(self, nsteps: int):
         self._n_steps_sb.setValue(nsteps)
 
-    def set_current_step(self, step_ind: int):
-        self._index_sb.setValue(step_ind)
-
-
+    def set_current_step(self, step_ind: float):
+        self._step_sb.setValue(step_ind)
 
 
 class RampExtension(CustomExt):
 
     _h5_base_group_name = 'Ramp'
-    _show_h5file_statusbar_widgets = True
+    show_h5file_statusbar_widgets = True
     show_workflow_actions = True
 
-    params = [
+    params = ([
         {'title': 'Ramping Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors to save:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
         {'title': 'Actuators to save:', 'name': 'actuators', 'type': 'itemselect', 'checkbox': True},
@@ -125,27 +128,31 @@ class RampExtension(CustomExt):
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
         ]},
-    ] + ExtensionWorker.params
+
+        ] + ExtensionWorker.params)
 
 
     def __init__(self, parent: gutils.DockArea, dashboard):
-        self.histogramer = HistogramPlot(dockarea=parent)
         self.ramping_worker = RampingWorker(self)
 
         super().__init__(parent, dashboard, add_toolbar_break=False)
+
 
 
         self.ramp: RampGenerator = None
 
         self.status_manager = StatusBarManager(self)
 
-
         self.histogramer_timer = QtCore.QTimer()
-        self.histogramer_timer.timeout.connect(self.update_histogramer)
+        #self.histogramer_timer.timeout.connect(self.update_histogramer)
 
         self._actuator: 'DAQ_Move' = None
 
         self._module_and_data_saver = RampSaver(self)
+
+        self.viewer = ViewerDispatcher(title='Histogram')
+        self.h5_browser = H5FileBrowsing(self.h5_manager)
+        self.histogram_worker: HistogramProcessor = None
 
         self.setup_ui()
 
@@ -154,6 +161,7 @@ class RampExtension(CustomExt):
 
         self.enable_workflow_actions(False)
 
+        self.h5_manager.file_open_signal.connect(lambda is_open: self.set_action_enabled('update_histogram', is_open))
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -164,10 +172,11 @@ class RampExtension(CustomExt):
         self.saving_dock.addWidget(self.h5saver.settings_tree)
 
         self.histogramer_dock = Dock('Histogram')
-        self.histogramer_dock.addWidget(self.histogramer.settings_tree)
+        self.histogramer_dock.addWidget(self.h5_browser.settings_tree)
+        self.histogramer_dock.addWidget(self.viewer.dockarea)
 
         self.dockarea.addDock(self.settings_dock, 'left')
-        self.dockarea.addDock(self.histogramer_dock, 'bottom', self.settings_dock)
+        self.dockarea.addDock(self.histogramer_dock, 'right', self.settings_dock)
         self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
         self.saving_dock.setVisible(False)
         self.populate_status_bar()
@@ -175,7 +184,7 @@ class RampExtension(CustomExt):
     def populate_status_bar(self):
         super().populate_status_bar()
         self.status_manager.create_permanent_widgets()
-        self.status_manager.set_permanent_status('')
+        self.status_manager.set_permanent_status('Waiting for instructions')
 
     def do_things_after_experiment_set(self, experiment_name: str, show_dashboard: bool = None):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
@@ -217,6 +226,10 @@ class RampExtension(CustomExt):
         self.add_action('ini_positions', 'Init Positions', 'arrows_input',
                         menu='actions',
                         toolbar=self.toolbar, tip='Go to Initial Ramp position')
+        self.toolbar.addSeparator()
+        self.add_action('update_histogram', 'UpdateHistogram', 'bar_chart',
+                        tip='Update the histogram given its settings',
+                        enabled=False,)
 
     def connect_things(self):
         """Connect actions and/or other widgets signal to methods"""
@@ -225,10 +238,7 @@ class RampExtension(CustomExt):
         self.connect_action(WorkFlowActions.PAUSE, self.ramping_worker.pause)
 
         self.connect_action('ini_positions', self.ramping_worker.go_to_ini_ramp)
-
-
-    def update_histogramer(self):
-        self.histogramer.compute_plot_histogram(self.settings['actuator'])
+        #self.connect_action('update_histogram', self.update_histogramer)
 
     @property
     def actuators_name(self) -> Iterable[str]:
@@ -303,13 +313,6 @@ class RampExtension(CustomExt):
 
         return True
 
-    def get_app_toolbars(self) -> list[QtWidgets.QToolBar]:
-        """ Get the main toolbars widget to be eventually added in the main window toolbararea
-
-        Default is the default toolbar. To be reimplemented if needed
-        """
-        return [self.toolbar, self.histogramer.toolbar]
-
 
 class RampingWorker(ExtensionWorker):
 
@@ -326,6 +329,20 @@ class RampingWorker(ExtensionWorker):
         self._paused_time: float = None
 
         self.current_node: GROUP | str = None
+
+    @property
+    def h5_browser(self) -> H5FileBrowsing:
+        return self.app.h5_browser
+
+    # @property
+    # def histogram_processor(self) -> HistogramProcessor:
+    #     return self.app.histogram_worker
+    #
+    #
+    # def _init_histogram_worker_and_start_it(self):
+    #     self.thread_manager.create_thread_for_worker('histogramer', self.histogram_worker)
+    #     self.thread_manager.start_thread('histogramer')
+
 
     @property
     def ramp(self) -> RampGenerator:
@@ -372,6 +389,7 @@ class RampingWorker(ExtensionWorker):
 
 
     def _start(self):
+        self.status_manager.set_permanent_status('Moving to Init value')
 
         self.modules_manager.move_actuators_with_callback(
             DataToExport(self.actuator.title, data=[DataActuator(self.actuator.title,
@@ -387,14 +405,19 @@ class RampingWorker(ExtensionWorker):
                                              module_type=ModuleType.Actuator,
                                              disconnect_modules=True)
 
+        self.status_manager.set_permanent_status('Initializing Ramp')
         self.ini_things()
         self.connect_modules()
+        self.status_manager.set_permanent_status('Started Ramping')
         self.run_ramp()
 
     def ini_things(self):
 
         if self.settings['use_steps']:
+            self.app.status_manager.n_steps = self.settings['steps', 'nsteps']
             self.ramp_timer.setInterval(int(self.settings['steps', 'time_step']))
+        else:
+            self.app.status_manager.n_steps = 1
 
         self.total_ramp_timer.setInterval(int(self.settings['ramp', 'duration'] * 1000))
         self.total_ramp_timer.setSingleShot(True)
@@ -461,6 +484,7 @@ class RampingWorker(ExtensionWorker):
         self.actuator.get_continuous_actuator_value(get_value=False)
 
     def run_ramp(self):
+        self.status_manager.is_ramping = True
         self._start_time = perf_counter()
         self.start_modules()
 
@@ -485,12 +509,13 @@ class RampingWorker(ExtensionWorker):
     def send_data(self, dte: DataToExport | DataActuator):
         if self.app.is_action_checked(WorkFlowActions.LOG):
             if isinstance(dte, DataActuator):
-                dte = DataToExport(dte.origin, data=[dte])
+                dte = DataToExport(dte.name, data=[dte])
 
             self.saver_worker.data_to_save_signal.emit(DataBundle(dte=dte))
             self._n_emitted += 1
 
     def _stop(self, msg: str = None):
+        self.status_manager.is_ramping = False
         self.ramp_timer.stop()
         self.total_ramp_timer.stop()
         #self.histogramer_timer.stop()
@@ -499,8 +524,9 @@ class RampingWorker(ExtensionWorker):
         self.stop_modules()
 
         self._start_time = None
+        self.status_manager.set_permanent_status('Stopped Ramping')
 
-        #self.app.update_histogramer()
+        self.h5_browser.update_settings_from_file(self.h5_manager.h5saver.file_path)
 
     def _pause(self, do_pause=True):
         if do_pause:
@@ -508,11 +534,13 @@ class RampingWorker(ExtensionWorker):
             #self.histogramer_timer.stop()
             self._paused_time = perf_counter()
             self.disconnect_modules()
+            self.status_manager.is_ramping = False
         else:
             self._start_time = perf_counter() - (self._paused_time - self._start_time)
 
             self.connect_modules()
             self.ramp_timer.start()
+            self.status_manager.is_ramping = True
             if self.app.is_action_checked(WorkFlowActions.LOG):
                 #self.histogramer_timer.start()
                 pass
@@ -524,6 +552,7 @@ class RampingWorker(ExtensionWorker):
 
         step = self.ramp(elapsed_time)
         self.settings['steps', 'step'] = step
+        self.status_manager.set_current_step(step)
         actuator_value = DataActuator('ramp',
                                      data=step,
                                      units=self.actuator.units,)
