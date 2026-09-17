@@ -17,6 +17,7 @@ from pymodaq.utils.managers.modules import ModuleType
 from pymodaq_data import DataToExport, DataWithAxes
 from pymodaq_gui import utils as gutils
 from pymodaq_gui.h5modules.saving import H5Saver
+from pymodaq_gui.managers.h5manager import FileAction
 from pymodaq_gui.messenger import messagebox
 from pymodaq_gui.parameter.utils import iter_children, get_param_path
 from pymodaq_gui.plotting.data_viewers import ViewerDispatcher
@@ -24,7 +25,7 @@ from pymodaq_gui.utils import DockArea, Dock, QSpinBox_ro
 from pymodaq_gui.utils.custom_app import WorkFlowActions
 
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
-from pymodaq_plugins_ramping.utilities.histograming import HistogramProcessor, H5FileBrowsing
+from pymodaq_plugins_ramping.utilities.histograming import HistogramProcessor, H5Histogramming, InfoForHistogram
 from pymodaq_plugins_ramping.utilities.module_saver import RampSaver, GROUP
 from pymodaq_scripting import Actuator
 from pymodaq_utils.config import GlobalConfig
@@ -151,8 +152,7 @@ class RampExtension(CustomExt):
         self._module_and_data_saver = RampSaver(self)
 
         self.viewer = ViewerDispatcher(title='Histogram')
-        self.h5_browser = H5FileBrowsing(self.h5_manager)
-        self.histogram_worker: HistogramProcessor = None
+        self.h5_histogrammer = H5Histogramming(self.h5_manager, self.viewer)
 
         self.setup_ui()
 
@@ -160,8 +160,13 @@ class RampExtension(CustomExt):
         self.update_velocity()
 
         self.enable_workflow_actions(False)
+        self.h5_manager.connect_action(FileAction.LOAD,
+                                       self.h5_manager.load_file,
+                                       connect=False)
+        self.h5_manager.connect_action(FileAction.LOAD,
+                                       lambda: self.h5_manager.load_file(mode='r'))
 
-        self.h5_manager.file_open_signal.connect(lambda is_open: self.set_action_enabled('update_histogram', is_open))
+        self.h5_manager.file_loaded_signal.connect(lambda: self.set_action_enabled('update_histogram', True))
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -169,15 +174,17 @@ class RampExtension(CustomExt):
         self.settings_dock = Dock('Settings')
         self.settings_dock.addWidget(self.settings_tree)
         self.saving_dock = Dock('Saving')
-        self.saving_dock.addWidget(self.h5saver.settings_tree)
+        self.saving_dock.addWidget(self.h5_manager.get_h5saver(create_new_file=False).settings_tree)
 
+        self.histogramer_settings_dock = Dock('Histogram Settings')
+        self.histogramer_settings_dock.addWidget(self.h5_histogrammer.settings_tree)
         self.histogramer_dock = Dock('Histogram')
-        self.histogramer_dock.addWidget(self.h5_browser.settings_tree)
         self.histogramer_dock.addWidget(self.viewer.dockarea)
 
         self.dockarea.addDock(self.settings_dock, 'left')
-        self.dockarea.addDock(self.histogramer_dock, 'right', self.settings_dock)
-        self.dockarea.addDock(self.saving_dock, 'right', self.settings_dock)
+        self.dockarea.addDock(self.histogramer_settings_dock, 'right', self.settings_dock)
+        self.dockarea.addDock(self.histogramer_dock, 'right', self.histogramer_settings_dock)
+        self.dockarea.addDock(self.saving_dock, 'right', self.histogramer_dock)
         self.saving_dock.setVisible(False)
         self.populate_status_bar()
 
@@ -238,7 +245,7 @@ class RampExtension(CustomExt):
         self.connect_action(WorkFlowActions.PAUSE, self.ramping_worker.pause)
 
         self.connect_action('ini_positions', self.ramping_worker.go_to_ini_ramp)
-        #self.connect_action('update_histogram', self.update_histogramer)
+        self.connect_action('update_histogram', self.h5_histogrammer.update_histogramer)
 
     @property
     def actuators_name(self) -> Iterable[str]:
@@ -311,6 +318,8 @@ class RampExtension(CustomExt):
             self.ramping_worker.stop("User prompted a quit of the Application, Stopping the Acquisition")
             return False
 
+        self.h5_manager.close_file()
+
         return True
 
 
@@ -330,9 +339,14 @@ class RampingWorker(ExtensionWorker):
 
         self.current_node: GROUP | str = None
 
+        self.worker_terminated.connect(self._on_worker_terminated)
+
+    def _on_worker_terminated(self):
+        self.h5_browser.update_settings_from_file(self.h5_manager.get_h5saver(mode='r').file_path)
+
     @property
-    def h5_browser(self) -> H5FileBrowsing:
-        return self.app.h5_browser
+    def h5_browser(self) -> H5Histogramming:
+        return self.app.h5_histogrammer
 
     # @property
     # def histogram_processor(self) -> HistogramProcessor:
@@ -390,6 +404,7 @@ class RampingWorker(ExtensionWorker):
 
     def _start(self):
         self.status_manager.set_permanent_status('Moving to Init value')
+        self._app.set_action_enabled('update_histogram', True)
 
         self.modules_manager.move_actuators_with_callback(
             DataToExport(self.actuator.title, data=[DataActuator(self.actuator.title,
@@ -423,6 +438,7 @@ class RampingWorker(ExtensionWorker):
         self.total_ramp_timer.setSingleShot(True)
 
         if self.app.is_action_checked(WorkFlowActions.LOG):
+            self.h5_manager.close_file()
             self.module_and_data_saver.h5saver = self.h5_manager.h5saver
             self.current_node = self.module_and_data_saver.get_set_node(new=True)
 
@@ -525,8 +541,6 @@ class RampingWorker(ExtensionWorker):
 
         self._start_time = None
         self.status_manager.set_permanent_status('Stopped Ramping')
-
-        self.h5_browser.update_settings_from_file(self.h5_manager.h5saver.file_path)
 
     def _pause(self, do_pause=True):
         if do_pause:

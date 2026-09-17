@@ -8,12 +8,13 @@ from pathlib import Path
 from qtpy import QtWidgets, QtCore
 from qtpy.QtCore import QObject
 
+from packages.pymodaq_gui.tests.h5module_test.saving_test import h5saver
 from pymodaq_gui.managers.h5manager import H5Manager
 from pymodaq_gui.utils.shared_ui import MenuToolbarNames
 from pymodaq_gui.parameter.ioxml import parameter_to_xml_string
 from pymodaq_utils.logger import set_logger, get_module_name
 from pymodaq.utils.shared_ui import SharedUI
-from pymodaq_data import DataToExport, DataWithAxes, DataCalculated, Axis, DataDistribution
+from pymodaq_data import DataToExport, DataWithAxes, DataCalculated, Axis, DataDistribution, DataDim
 from pymodaq_data.h5modules.data_saving import DataLoader, Node, DataToExportSaver
 from pymodaq_gui.h5modules.saving import H5Saver, GROUP
 from pymodaq_gui.managers.parameter_manager import ParameterManager, Parameter
@@ -27,7 +28,7 @@ from pymodaq_utils.math_utils import find_index
 logger = set_logger(get_module_name(__file__))
 
 
-class H5FileBrowsing(QObject, ParameterManager):
+class H5Histogramming(QObject, ParameterManager):
     params = [
         {'title': 'H5:', 'name': 'h5info', 'type': 'group', 'children': [
             {'title': 'H5 Path:', 'name': 'h5path', 'type': 'str', 'value': '', 'readonly': True},
@@ -40,27 +41,66 @@ class H5FileBrowsing(QObject, ParameterManager):
             {'title': 'Actuators to Plot:', 'name': 'actuators', 'type': 'itemselect', 'checkbox': True},
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
-            {'title': 'AutoBin:', 'name': 'autobin', 'type': 'led', 'value': False},
+            {'title': 'AutoBin:', 'name': 'autobin', 'type': 'bool', 'value': True},
             {'title': 'Nbin:', 'name': 'nbins', 'type': 'int', 'value': 100, 'readonly': False},
         ]},
+        {'title': 'Compute Histogram', 'name': 'compute_histogram', 'type': 'action'}
     ]
 
-    def __init__(self, h5_manager: H5Manager, parent=None):
+    def __init__(self, h5_manager: H5Manager, viewer: ViewerDispatcher, parent=None):
         QObject.__init__(self, parent)
         ParameterManager.__init__(self)
 
         self._h5_manager = h5_manager
+        self._viewer = viewer
         self._actuators: dict[str, str] = {}
         self._detectors: dict[str, str] = {}
         self._data_loader: DataLoader = None
 
+        self._histogram_processor: HistogramProcessor = None
+
         self._h5_manager.file_loaded_signal.connect(self.update_settings_from_file)
 
+        self.settings.child('compute_histogram').setOpts(enabled=False)
+
+    @property
+    def histogram_processor(self) -> 'HistogramProcessor':
+        if self._histogram_processor is None:
+            self._histogram_processor = HistogramProcessor(self._h5_manager.h5saver)
+            self._histogram_processor.nbins_signal.connect(
+                self.settings.child('histo', 'nbins').setValue)
+
+            self.settings.child('compute_histogram').sigActivated.connect(self.update_histogramer)
+            self._histogram_processor.data_processed.connect(self._viewer.show_data)
+        return self._histogram_processor
+
+    def update_histogramer(self):
+        self.histogram_processor.info_for_histogram_signal.emit(
+            InfoForHistogram(self.settings['h5info', 'node_path'],
+                             xaxis_name=self.settings['histo', 'actuator'],
+                             start=self.settings['histo', 'start'],
+                             stop=self.settings['histo', 'stop'],
+                             other_names=self.settings['histo', 'actuators']['selected'] +
+                                         self.settings['histo', 'detectors']['selected'],
+                             bins='auto' if self.settings['histo', 'autobin'] else
+                             self.settings['histo', 'nbins'],
+                             )
+        )
+
     def update_settings_from_file(self, file_path: Path):
+        """ Offline mode. Means ramping is not in progress and the h5file was closed and has
+        been opened for here
+        """
+        self.settings.child('compute_histogram').setOpts(enabled=True)
+        self.settings['h5info', 'node_path'] = None
+        self._data_loader = DataLoader(self._h5_manager.h5saver,
+                                       swmr_mode=False)
         self.settings['h5info', 'h5path'] = str(file_path)
         nodes = self.get_main_nodes()
         if len(nodes) > 0:
+            self.disconnect_tree()
             self.settings.child('h5info', 'node_path').setLimits(nodes)
+            self.connect_tree()
             self.settings['h5info', 'node_path'] = nodes[-1]
 
     @property
@@ -74,17 +114,17 @@ class H5FileBrowsing(QObject, ParameterManager):
                 nodes.append(_node.path)
         return nodes
 
-    def get_actuators(self, node: str | GROUP) -> dict[str, str]:
+    def get_actuators(self, main_node: str | GROUP) -> dict[str, str]:
         self._actuators = {}
-        for ind, node in enumerate(self.data_loader.walk_nodes(node, depth=1, only_groups=True)):
+        for ind, node in enumerate(self.data_loader.walk_nodes(main_node, depth=1, only_groups=True)):
             if ('type' in node.attrs and node.attrs['type'] == 'actuator' and
                     len(node.children()) > 0):
                 self._actuators[node.title] = node.path
         return self._actuators
 
-    def get_detectors(self, node: str | GROUP) -> dict[str, str]:
+    def get_detectors(self, main_node: str | GROUP) -> dict[str, str]:
         self._detectors = {}
-        for ind, node in enumerate(self.data_loader.walk_nodes(node, depth=1, only_groups=True)):
+        for ind, node in enumerate(self.data_loader.walk_nodes(main_node, depth=1, only_groups=True)):
             if ('type' in node.attrs and node.attrs['type'] == 'detector' and
                     len(node.children()) > 0):
                 self._detectors[node.title] = node.path
@@ -98,11 +138,21 @@ class H5FileBrowsing(QObject, ParameterManager):
 
     def value_changed(self, param: Parameter):
         if param.name()  == 'node_path':
-            if param.value() is not None:
+            if not (param.value() is None or param.value() == '') :
                 self.update_control_modules()
+                bin_size = self.check_min_axis_size()
+
+                if bin_size is None:
+                    self.settings['histo', 'autobin'] = True
+                else:
+                    self.settings['histo', 'nbins'] = bin_size
+
         elif param.name() == 'actuator':
             if param.value() in self._actuators:
                 self.get_set_bounds(param.value())
+
+        elif param.name()  == 'autobin':
+            self.settings.child('histo', 'nbins').setReadonly(param.value())
 
     def get_set_bounds(self, actuator_name: str):
         dwa = self.data_loader.load_all(where=self._actuators[actuator_name])[0]
@@ -125,7 +175,7 @@ class H5FileBrowsing(QObject, ParameterManager):
             actuator_name = actuators_name.pop(0)
         else:
             actuator_name = self.settings['histo', 'actuator']
-        self.settings.child('histo', 'actuator').setOpts(limits=actuators_name)
+        self.settings.child('histo', 'actuator').setOpts(limits=actuators_name + [actuator_name])
 
         self.settings.child('histo', 'actuators').setValue(dict(all_items=actuators_name,
                                                                 selected=actuators_name, ))
@@ -133,31 +183,22 @@ class H5FileBrowsing(QObject, ParameterManager):
                                                                 selected=detectors_name, ))
 
         self.connect_tree()
+        print(actuator_name)
         self.settings['histo', 'actuator'] = actuator_name
 
-        # if len(nodes) == 0:
-        #     if node_name is None:
-        #         return
-        #     else:
-        #         nodes = [node_name]
-        # else:
-        #     if node_name is None:
-        #         node_name = nodes[0]
-        # self.settings.node_path = node_name
-        # self.settings.nodes_path = nodes
-        #
-        # bin_size = self.check_min_axis_size()
-        #
-        # if bin_size is None:
-        #     self.settings.autobin = True
-        # else:
-        #     self.settings.nbins = bin_size
+    def get_data(self):
+
+        x_dwa = self.get_actuator_dwa(self.settings['histo', 'actuator'])
+        dte_0d = DataToExport('Data0D')
+        for actuator in self.settings['histo', 'actuators']['selected']:
+            dte_0d.append(self.get_actuator_dwa(actuator))
+        for detector in self.settings['histo', 'detectors']['selected']:
+            dte_0d.append(self.get_detector_dte(detector).get_data_from_dim(DataDim.Data0D))
 
     def check_min_axis_size(self) -> int | None:
         """ Look at the arrays under current node for the minimal navigation size"""
         min_size = None
-        dl = DataLoader(self.h5saver, swmr_mode=True)
-        for ind, node in enumerate(dl.walk_nodes(self.settings.node_path)):
+        for ind, node in enumerate(self.data_loader.walk_nodes(self.settings['h5info', 'node_path'])):
             if 'shape' in node.attrs:
                 if min_size is None:
                     min_size = node.attrs['shape'][0]
@@ -167,136 +208,39 @@ class H5FileBrowsing(QObject, ParameterManager):
 
 
 
+@dataclass
+class InfoForHistogram:
+    node_path: str
+    xaxis_name: str
 
+    start: float
+    stop: float
+    other_names: list[str] = field(default_factory=list)
+
+    bins: float | None = None
 
 class HistogramProcessor(QtCore.QObject):
 
     data_processed = QtCore.Signal(DataToExport)
-    process_data = QtCore.Signal(str)
+    info_for_histogram_signal = QtCore.Signal(InfoForHistogram)
+    nbins_signal = QtCore.Signal(int)
 
-    params = [
-        {'title': 'H5:', 'name': 'h5info', 'type': 'group', 'children': [
-            {'title': 'H5 Path:', 'name': 'h5path', 'type': 'str', 'value': '', 'readonly': True},
-            {'title': 'Node:', 'name': 'node_path', 'type': 'list', 'limits': [], 'readonly': True},
-            {'title': 'Actuator:', 'name': 'actuator', 'type': 'list', 'limits': [], 'readonly': True},
-        ]},
-        {'title': 'Histo:', 'name': 'histo', 'type': 'group', 'children': [
-            {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
-            {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
-            {'title': 'AutoBin:', 'name': 'autobin', 'type': 'led', 'value': False},
-            {'title': 'Nbin:', 'name': 'nbins', 'type': 'int', 'value': 100, 'readonly': False},
-            ]},
-
-    ]
     def __init__(self, h5saver: H5Saver, parent=None):
         QtCore.QObject.__init__(self, parent)
 
         self.h5saver = h5saver
-        self.data_loader = DataLoader(self.h5saver, swmr_mode=True)
-        self.process_data.connect(self.compute_histogram, QtCore.Qt.ConnectionType.QueuedConnection)
+        self._data_loader = DataLoader(h5saver, swmr_mode=True)
 
+        self.info_for_histogram_signal.connect(self.compute_histogram)
 
-    def update_h5_saver(self, h5saver: H5Saver | str | Path,
-                        node: str = 'RawData/Ramp000',
-                        actuator: str = None,
-                        ):
-        if isinstance(h5saver, H5Saver):
-            self.settings.h5path = str(h5saver.file_path)
-            self.h5saver = h5saver
-        else:
-            self.settings.h5path = str(h5saver)
-            self.h5saver = H5Saver()
-            self.h5saver.init_file(addhoc_file_path=h5saver)
-        self.update_node(node)
-        self.update_actuator(actuator)
+    def compute_histogram(self, info: InfoForHistogram) -> DataToExport:
+        dte_out = DataToExport('DataOut')
 
-    def update_node(self, node_name: str | Node = None):
-        if isinstance(node_name, Node):
-            node_name = node_name.path
-        nodes = []
-        dl =  DataLoader(self.h5saver, swmr_mode=True)
-        for ind, _node in enumerate(dl.walk_nodes('/RawData', depth=1, only_groups=True)):
-            if ind > 0:
-                nodes.append(_node.path)
-
-        if len(nodes) == 0:
-            if node_name is None:
-                return
-            else:
-                nodes = [node_name]
-        else:
-            if node_name is None:
-                node_name = nodes[0]
-        self.settings.node_path = node_name
-        self.settings.nodes_path = nodes
-
-        bin_size = self.check_min_axis_size()
-
-        if bin_size is None:
-            self.settings.autobin = True
-        else:
-            self.settings.nbins = bin_size
-
-    def check_min_axis_size(self) -> int | None:
-        """ Look at the arrays under current node for the minimal navigation size"""
-        min_size = None
-        dl = DataLoader(self.h5saver, swmr_mode=True)
-        for ind, node in enumerate(dl.walk_nodes(self.settings.node_path)):
-            if 'shape' in node.attrs:
-                if min_size is None:
-                    min_size = node.attrs['shape'][0]
-                else:
-                    min_size = min(min_size, node.attrs['shape'][0])
-        return min_size
-
-    def update_actuator(self, actuator: str = None):
-        actuators = []
-        dl = DataLoader(self.h5saver, swmr_mode=True)
-        for ind, node in enumerate(dl.walk_nodes('/RawData', depth=2, only_groups=True)):
-            if ('type' in node.attrs and node.attrs['type'] == 'actuator' and
-            len(node.children()) > 0):
-                actuators.append(node.title)
-        if len(actuators) == 0:
-            if actuator is None:
-                return
-            else:
-                actuators = [actuator]
-        else:
-            if actuator is None:
-                actuator = actuators[0]
-
-        if actuator is None or actuator not in actuators:
-            actuator = actuators[0]
-        self.settings.actuator = actuator
-        self.settings.actuators = actuators
-
-
-    def compute_histogram(self, xaxis_name: str) -> DataToExport:
-
-        actuators = self.settings.actuators
-
-        if xaxis_name not in actuators:
-            xaxis_name = actuators[0]
-        self.settings.actuator = xaxis_name
-
-        dte_out = DataToExport('Histogram')
-        logger.info('computing histogram')
-
-        file_path = self.h5saver
-        if isinstance(file_path, H5Saver):
-            file_path = file_path.file_path
-        dl = DataLoader(file_path, swmr_mode=True)
-        dte = dl.load_all(where=self.settings.node_path)
-
-        if xaxis_name not in dte.get_names():
-            self.data_processed.emit(dte_out)
-            return dte_out
-
-        xdwa = dte.pop(dte.index_from_name_origin(xaxis_name))
+        dte = self._data_loader.load_all(where=info.node_path)
+        xdwa = dte.pop(dte.index_from_name_origin(info.xaxis_name))
 
         ((istart, vstart), (istop, vstop)) = find_index(
-            xdwa[0], threshold=[self.settings.start,
-                                self.settings.stop])
+            xdwa[0], threshold=[info.start, info.stop])
 
         nav_index = xdwa.nav_indexes[0]
         try:
@@ -306,18 +250,16 @@ class HistogramProcessor(QtCore.QObject):
 
         # first compute bins from one of the varying signals
         timestamps = xdwa_sliced.get_axis_from_index(nav_index)[0].get_data()
-        nbins = 'auto' if self.settings.autobin else self.settings.nbins
-        if nbins == 'auto':
-            estimate_nbins = len(np.histogram_bin_edges(dte[0][0], 'auto')) + 1
+        if info.bins == 'auto':
+            nbins = len(np.histogram_bin_edges(dte[0][0], 'auto')) + 1
         else:
-            estimate_nbins = nbins
+            nbins = info.bins
 
-        bin_edges = np.histogram_bin_edges(
-            timestamps,
-            bins=estimate_nbins)
+        bin_edges = np.histogram_bin_edges(timestamps, bins=nbins)
 
-        if len(bin_edges) - 1 != nbins:
-            self.settings.nbins = len(bin_edges + 1)
+        if info.bins == 'auto':
+            self.nbins_signal.emit(len(bin_edges) - 1)
+
         # then compute the bin index for each timestamp
         indexes = np.digitize(timestamps, bin_edges)
 
