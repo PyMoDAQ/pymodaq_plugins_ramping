@@ -98,13 +98,15 @@ class StatusBarManager:
         self._n_steps_sb.setValue(nsteps)
 
     def set_current_step(self, step_ind: float | Q_):
-        if isinstance(step_ind, Q_):
-            self._step_sb.setOpts(value=step_ind.magnitude, suffix=step_ind.units)
-        else:
-            self._step_sb.setValue(step_ind)
+        if self._step_sb is not None:
+            if isinstance(step_ind, Q_):
+                self._step_sb.setOpts(value=step_ind.magnitude, suffix=step_ind.units)
+            else:
+                self._step_sb.setValue(step_ind)
 
     def set_step_units(self, units: str):
-        self._step_sb.setOpts(suffix=units, siPrefix=True)
+        if self._step_sb is not None:
+           self._step_sb.setOpts(suffix=units, siPrefix=True)
 
 
 class RampExtension(CustomExt):
@@ -117,14 +119,14 @@ class RampExtension(CustomExt):
         {'title': 'Ramping Actuator:', 'name': 'actuator', 'type': 'list', },
         {'title': 'Detectors to save:', 'name': 'detectors', 'type': 'itemselect', 'checkbox': True},
         {'title': 'Actuators to save:', 'name': 'actuators', 'type': 'itemselect', 'checkbox': True},
-        {'title': 'Refresh Grab:', 'name': 'refresh_grab', 'type': 'float', 'value': 50e-3, 'suffix': 's',
+        {'title': 'Refresh Grab:', 'name': 'refresh_grab', 'type': 'float', 'value': 200e-3, 'suffix': 's',
          'siPrefix': True},
         {'title': 'Refresh Plot:', 'name': 'refresh_plot', 'type': 'float', 'value': 500e-3, 'suffix': 's',
          'siPrefix': True},
         {'title': 'Ramp:', 'name': 'ramp', 'type': 'group', 'children': [
             {'title': 'Start:', 'name': 'start', 'type': 'float', 'value': 500.},
             {'title': 'Stop:', 'name': 'stop', 'type': 'float', 'value': 560.},
-            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 40,
+            {'title': 'Duration:', 'name': 'duration', 'type': 'float', 'value': 20,
              'suffix': config('ramping', 'duration_units')[0], 'siPrefix': True,
              'readonly': config('ramping', 'ramp_setting')[0] != 'duration'},
             {'title': 'Velocity:', 'name': 'velocity', 'type': 'float', 'value': 0,
@@ -133,7 +135,7 @@ class RampExtension(CustomExt):
         ]},
         {'title': 'Use Steps:', 'name': 'use_steps', 'type': 'bool', 'value': True},
         {'title': 'Steps:', 'name': 'steps', 'type': 'group', 'children': [
-            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 200e-3, 'suffix': 's',
+            {'title': 'Time Step:', 'name': 'time_step', 'type': 'float', 'value': 500e-3, 'suffix': 's',
              'siPrefix': True},
             {'title': 'Nsteps:', 'name': 'nsteps', 'type': 'int', 'value': 1, 'readonly': True},
             {'title': 'Current Step:', 'name': 'step', 'type': 'float', 'value': 300.},
@@ -144,14 +146,14 @@ class RampExtension(CustomExt):
 
     def __init__(self, parent: gutils.DockArea, dashboard):
         self.ramping_worker = RampingWorker(self)
-
+        self.status_manager = StatusBarManager(self)
         super().__init__(parent, dashboard, add_toolbar_break=False)
 
 
 
         self.ramp: RampGenerator = None
 
-        self.status_manager = StatusBarManager(self)
+
 
         self.histogramer_timer = QtCore.QTimer()
         #self.histogramer_timer.timeout.connect(self.update_histogramer)
@@ -176,6 +178,9 @@ class RampExtension(CustomExt):
                                        lambda: self.h5_manager.load_file(mode='r'))
 
         self.h5_manager.file_loaded_signal.connect(lambda: self.set_action_enabled('update_histogram', True))
+
+        if self.experiment_manager.entry_applied:
+            self.enable_workflow_actions(True, other_actions='ini_positions')
 
     def setup_docks_and_widgets(self):
         """Mandatory method to be subclassed to setup the docks layout
@@ -206,9 +211,12 @@ class RampExtension(CustomExt):
         super().do_things_after_experiment_set(experiment_name, show_dashboard)
         self.settings.child('actuator').setLimits(self.modules_manager.actuators_name)
         self.display_control_modules()
-
-        self.enable_workflow_actions(True, other_actions='ini_positions')
         self._module_and_data_saver = RampSaver(self)
+
+        try:
+            self.enable_workflow_actions(True, other_actions='ini_positions')
+        except KeyError: #actions may not yet be activated
+            pass
 
     def display_control_modules(self):
         selected = self.settings['detectors']['selected']

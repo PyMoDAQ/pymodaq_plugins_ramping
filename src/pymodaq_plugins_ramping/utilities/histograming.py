@@ -62,6 +62,7 @@ class H5Histogramming(QObject, ParameterManager):
         self._h5_manager.file_loaded_signal.connect(self.update_settings_from_file)
 
         self.settings.child('compute_histogram').setOpts(enabled=False)
+        self.settings.child('compute_histogram').sigActivated.connect(self.update_histogramer)
 
     @property
     def histogram_processor(self) -> 'HistogramProcessor':
@@ -70,7 +71,7 @@ class H5Histogramming(QObject, ParameterManager):
             self._histogram_processor.nbins_signal.connect(
                 self.settings.child('histo', 'nbins').setValue)
 
-            self.settings.child('compute_histogram').sigActivated.connect(self.update_histogramer)
+
             self._histogram_processor.data_processed.connect(self._viewer.show_data)
         return self._histogram_processor
 
@@ -92,16 +93,20 @@ class H5Histogramming(QObject, ParameterManager):
         been opened for here
         """
         self.settings.child('compute_histogram').setOpts(enabled=True)
-        self.settings['h5info', 'node_path'] = None
+        node_param = self.settings.child('h5info', 'node_path')
+
         self._data_loader = DataLoader(self._h5_manager.h5saver,
                                        swmr_mode=False)
         self.settings['h5info', 'h5path'] = str(file_path)
         nodes = self.get_main_nodes()
-        if len(nodes) > 0:
-            self.disconnect_tree()
-            self.settings.child('h5info', 'node_path').setLimits(nodes)
-            self.connect_tree()
-            self.settings['h5info', 'node_path'] = nodes[-1]
+        with node_param.change_transaction(emit_signal=False):
+            self.settings.child('h5info', 'node_path').setValue(node_param)
+            node_param.setLimits(nodes)
+            node_param.setValue(nodes[-1] if len(nodes) > 0 else None)
+
+        self._on_node_path_change()
+
+        self.update_histogramer()
 
     @property
     def data_loader(self) -> DataLoader:
@@ -136,20 +141,25 @@ class H5Histogramming(QObject, ParameterManager):
     def get_detector_dte(self, detector_name: str) -> DataToExport:
         return self.data_loader.load_all(self._actuators[detector_name], with_bkg=False)
 
-    def value_changed(self, param: Parameter):
-        if param.name()  == 'node_path':
-            if not (param.value() is None or param.value() == '') :
-                self.update_control_modules()
-                bin_size = self.check_min_axis_size()
+    def _on_node_path_change(self):
+        self.update_control_modules()
+        bin_size = self.check_min_axis_size()
 
-                if bin_size is None:
-                    self.settings['histo', 'autobin'] = True
-                else:
-                    self.settings['histo', 'nbins'] = bin_size
+        if bin_size is None:
+            self.settings['histo', 'autobin'] = True
+        else:
+            self.settings['histo', 'nbins'] = bin_size
+
+    def _on_actuator_changed(self, actuator_name: str):
+        self.get_set_bounds(actuator_name)
+
+    def value_changed(self, param: Parameter):
+        if param.name() == 'node_path':
+            self._on_node_path_change()
 
         elif param.name() == 'actuator':
             if param.value() in self._actuators:
-                self.get_set_bounds(param.value())
+                self._on_actuator_changed(param.value())
 
         elif param.name()  == 'autobin':
             self.settings.child('histo', 'nbins').setReadonly(param.value())
@@ -163,7 +173,8 @@ class H5Histogramming(QObject, ParameterManager):
 
     def update_control_modules(self):
 
-        self.disconnect_tree()
+        group_histo = self.settings.child('histo')
+        actuator_param = self.settings.child('histo', 'actuator')
 
         actuators = self.get_actuators(self.settings['h5info', 'node_path'])
         detectors = self.get_detectors(self.settings['h5info', 'node_path'])
@@ -175,15 +186,19 @@ class H5Histogramming(QObject, ParameterManager):
             actuator_name = actuators_name.pop(0)
         else:
             actuator_name = self.settings['histo', 'actuator']
-        self.settings.child('histo', 'actuator').setOpts(limits=actuators_name + [actuator_name])
+            actuators_name.remove(self.settings['histo', 'actuator'])
 
-        self.settings.child('histo', 'actuators').setValue(dict(all_items=actuators_name,
-                                                                selected=actuators_name, ))
-        self.settings.child('histo', 'detectors').setValue(dict(all_items=detectors_name,
-                                                                selected=detectors_name, ))
+        with actuator_param.change_transaction(emit_signal=False):
+            group_histo.child('actuator').setOpts(limits=[actuator_name] + actuators_name)
 
-        self.connect_tree()
-        self.settings['histo', 'actuator'] = actuator_name
+            group_histo.child('actuators').setValue(dict(all_items=actuators_name,
+                                                                    selected=actuators_name, ))
+            group_histo.child('detectors').setValue(dict(all_items=detectors_name,
+                                                                    selected=detectors_name, ))
+            group_histo.child('actuator').setValue(actuator_name)
+
+        self._on_actuator_changed(actuator_name)
+
 
     def get_data(self):
 
@@ -205,8 +220,6 @@ class H5Histogramming(QObject, ParameterManager):
                     min_size = min(min_size, node.attrs['shape'][0])
         return min_size
 
-
-
 @dataclass
 class InfoForHistogram:
     node_path: str
@@ -217,6 +230,8 @@ class InfoForHistogram:
     other_names: list[str] = field(default_factory=list)
 
     bins: float | None = None
+
+
 
 class HistogramProcessor(QtCore.QObject):
 
