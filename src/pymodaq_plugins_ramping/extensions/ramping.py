@@ -155,9 +155,6 @@ class RampExtension(CustomExt):
 
 
 
-        self.histogramer_timer = QtCore.QTimer()
-        #self.histogramer_timer.timeout.connect(self.update_histogramer)
-
         self._actuator: 'DAQ_Move' = None
 
         self._module_and_data_saver = RampSaver(self)
@@ -380,6 +377,9 @@ class RampingWorker(ExtensionWorker):
         self.total_ramp_timer = QtCore.QTimer()
         self.total_ramp_timer.timeout.connect(self.stop)
 
+        self.histogramer_timer = QtCore.QTimer()
+        #self.histogramer_timer.timeout.connect(self.update_histogramer)
+
         self._start_time: Q_ = None
         self._paused_time: Q_ = None
 
@@ -394,15 +394,13 @@ class RampingWorker(ExtensionWorker):
     def h5_browser(self) -> H5Histogramming:
         return self.app.h5_histogrammer
 
-    # @property
-    # def histogram_processor(self) -> HistogramProcessor:
-    #     return self.app.histogram_worker
-    #
-    #
-    # def _init_histogram_worker_and_start_it(self):
-    #     self.thread_manager.create_thread_for_worker('histogramer', self.histogram_worker)
-    #     self.thread_manager.start_thread('histogramer')
+    @property
+    def histogram_processor(self) -> HistogramProcessor:
+        return self.app.h5_histogrammer.histogram_processor
 
+    def _init_histogram_worker_and_start_it(self):
+        self.thread_manager.create_thread_for_worker('histogramer', self.histogram_worker)
+        self.thread_manager.start_thread('histogramer')
 
     @property
     def ramp(self) -> RampGenerator:
@@ -473,7 +471,30 @@ class RampingWorker(ExtensionWorker):
         self.status_manager.set_permanent_status('Started Ramping')
         self.run_ramp()
 
+    @property
+    def histo_settings(self) -> Parameter:
+        return self.app.h5_histogrammer.settings
+
+    def update_histogramer_settings(self):
+        with self.histo_settings.change_transaction(emit_signal=False):
+            self.histo_settings['h5info', 'h5path'] = str(self.h5_manager.h5saver.file_path)
+            self.histo_settings['h5info', 'node_path'] = self.current_node.path
+            self.histo_settings.child('histo', 'actuator').setLimits([self.actuator.title])
+
+            self.histo_settings['histo', 'start'] = self.ramp.start.m_as(self.actuator.units)
+            self.histo_settings['histo', 'stop'] = self.ramp.start.m_as(self.actuator.units)
+
+            self.histo_settings['histo', 'actuators'] = dict(
+                all_items=self.settings['actuators']['all_items'],
+                selected=self.settings['actuators']['selected'])
+            self.histo_settings['histo', 'detectors'] = dict(
+                all_items=self.settings['detectors']['all_items'],
+                selected=self.settings['detectors']['selected'])
+            self.histo_settings['histo', 'autobin'] = True
+        self.histo_settings.setOpts(enabled=False)
+
     def ini_things(self):
+
 
         if self.settings['use_steps']:
             self.app.status_manager.n_steps = self.settings['steps', 'nsteps']
@@ -490,7 +511,7 @@ class RampingWorker(ExtensionWorker):
             self.h5_manager.close_file()
             self.module_and_data_saver.h5saver = self.h5_manager.h5saver
             self.current_node = self.module_and_data_saver.get_set_node(new=True)
-
+            self.update_histogramer_settings()
             # self.histogramer.update_h5_saver(self.h5saver.file_path,
             #                                  node=self.current_node,
             #                                  actuator=self.settings['actuator'],
@@ -512,7 +533,6 @@ class RampingWorker(ExtensionWorker):
         for actuator in self.actuators:
             actuator.current_value_signal.connect(self.send_data)
         self.actuator.current_value_signal.connect(self.send_data)
-
 
     def start_modules(self):
         for detector in self.detectors:
