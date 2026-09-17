@@ -183,7 +183,6 @@ class H5Histogramming(QObject, ParameterManager):
                                                                 selected=detectors_name, ))
 
         self.connect_tree()
-        print(actuator_name)
         self.settings['histo', 'actuator'] = actuator_name
 
     def get_data(self):
